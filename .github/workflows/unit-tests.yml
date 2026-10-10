@@ -170,6 +170,31 @@ jobs:
             approval::tests::a_displaced_record_is_not_collected_as_an_abandoned_offer \
             approval::tests::the_signed_transaction_carries_the_fees_the_render_showed \
             approval::tests::a_zero_tip_is_flagged_however_it_is_spelled \
+            btc::tests::bip84_published_vectors_reproduce_keys_and_addresses \
+            btc::tests::bip86_published_vectors_reproduce_keys_and_addresses \
+            btc::tests::the_descriptor_checksum_matches_bip380 \
+            btc::tests::a_test_chain_uses_coin_type_one_and_never_signs_for_mainnet \
+            psbt::tests::change_that_pays_a_key_outside_the_wallet_is_shown_as_a_send \
+            psbt::tests::a_false_input_amount_is_refused_before_anything_is_shown \
+            psbt::tests::a_native_segwit_input_without_its_previous_transaction_is_refused \
+            psbt::tests::a_foreign_input_is_refused \
+            signer::tests::the_keystore_passes_the_signer_conformance_suite \
+            signer::tests::an_unlock_signs_without_the_password_until_its_count_runs_out \
+            signer::tests::an_unlock_ends_when_its_time_passes_or_on_lock \
+            signer::tests::a_password_signs_without_touching_an_unlocks_count \
+            signer::tests::a_database_key_comes_from_the_password_or_an_unlock_only \
+            signer::tests::a_scheme_or_path_that_is_not_the_accounts_is_refused_before_any_vault_opens \
+            gate::tests::tier_m_admits_only_the_manager_for_every_signing_call \
+            gate::tests::a_configuration_that_does_not_name_managers_leaves_signing_to_nobody \
+            announcing_sends_the_keystores_event_and_the_signer_interfaces \
+            psbt::tests::a_coin_spent_twice_is_refused \
+            psbt::tests::a_sighash_other_than_all_is_refused \
+            psbt::tests::script_paths_and_signed_inputs_are_refused \
+            psbt::tests::signatures_verify_against_the_sighash_computed_independently \
+            approval::tests::a_bitcoin_request_is_read_shown_and_signed_by_the_keystore \
+            approval::tests::a_vault_holding_another_wallets_key_signs_nothing \
+            keystore::tests::an_evm_group_record_is_written_exactly_as_before \
+            keystore::tests::a_bitcoin_wallet_is_refused_where_only_evm_derivation_belongs \
             every_mutation_a_reader_can_see_announces_itself_on_the_success_path \
             nothing_else_announces_and_no_read_path_does \
             a_rename_announces_even_though_it_moves_no_count \

@@ -17,18 +17,23 @@ use std::time::Duration;
 
 use crate::ack::Unrecoverable;
 use crate::approval::Approvals;
+use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, Keystore, Storage};
+use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
+use crate::BitcoinImport;
+use logos_signer_interface::jobs::JobTable;
+use logos_signer_interface::{json as signer_json, wire};
 
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
 /// module method. Private keys never appear in any signature — only addresses,
 /// signed payloads, and (re-encrypted) keystore JSON cross the boundary.
 pub trait KeystoreModule: Send + 'static {
-    /// Name who holds the two roles: `{ approver?, custodian? }` → `{ ok, approver,
-    /// custodian }`. TOTAL — a role the document does not name is held by nobody — and it
-    /// takes effect at once, on a module that has been serving the built-in defaults
-    /// (`evm_signer_ui`, `evm_keystore_ui`) since it loaded. A malformed document is refused and
-    /// the roles in force are left untouched.
+    /// Name who holds the three roles: `{ approvers?, custodians?, managers? }` → `{ ok,
+    /// approvers, custodians, managers }`. TOTAL — a role the document does not name is held by
+    /// nobody — and it takes effect at once, on a module that has been serving the built-in
+    /// defaults (`evm_signer_ui`, `evm_keystore_ui`, `signer_manager_module`) since it loaded. A
+    /// malformed document is refused and the roles in force are left untouched.
     ///
     /// UNGATED, deliberately and for now: any caller can name itself custodian and then
     /// mutate the keystore. Protecting it is deferred, not refuted — see docs/specs.md.
@@ -171,6 +176,37 @@ pub trait KeystoreModule: Send + 'static {
     /// The human said no.
     fn reject(&mut self, handle: String) -> bool;
 
+    // ── logos.signer/1: the keystore as a signer ─────────────────────────
+    /// `{ ok, interface, kind, model, families, requestKinds, showsRequest, collects }`. UNGATED:
+    /// it describes this kind of signer, not any account.
+    fn signer_info(&mut self) -> String;
+    /// Every account as public material, `{ ok, accounts }`. The manager and the custodian only:
+    /// a Bitcoin wallet's xpub reveals its whole history.
+    fn signer_accounts(&mut self) -> String;
+    /// Sign the hashes the manager prepared, with the account's password or inside an unlock.
+    /// `{ account, kind: "hash", items, secret? }` → `{ ok, job }`. Tier M.
+    fn sign(&mut self, request_json: String) -> String;
+    /// `{ ok, job, state, code?, error? }`. Tier M.
+    fn sign_status(&mut self, job: String) -> String;
+    /// `{ ok, job, signatures }`, repeatable until the job is swept. Tier M.
+    fn sign_result(&mut self, job: String) -> String;
+    /// `{ ok, job }`. Tier M.
+    fn cancel_sign(&mut self, job: String) -> String;
+    /// Hold an account's key in memory until `ttlMs` passes or `count` requests are signed.
+    /// `{ account, password, ttlMs?, count? }` → `{ ok, account, expiresInMs, countLeft }`. Tier M:
+    /// the manager keeps which apps the unlock covers, so nothing else may reach it.
+    fn unlock(&mut self, params_json: String) -> String;
+    /// `{ account? }` locks one account, `{}` every one → `{ ok, locked }`. Tier M.
+    fn lock(&mut self, params_json: String) -> String;
+    /// `{ ok, unlocked: [{ account, expiresInMs, countLeft }] }`. The manager and the custodian.
+    fn unlocked(&mut self) -> String;
+    /// A Bitcoin wallet's database key for an open request the keys app approved:
+    /// `{ group, password? }` → `{ ok, group, databaseKey }`, from its unlock when no password. Tier M.
+    fn database_key(&mut self, params_json: String) -> String;
+    /// A Bitcoin wallet from a phrase: `{ phrase, passphrase?, family, chain, account?, password,
+    /// label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`. Tier D.
+    fn import_bitcoin(&mut self, params_json: String) -> String;
+
     /// Observability: what this module currently sees as its caller. Ungated
     /// and side-effect-free — identity cannot report its own absence.
     fn caller_identity(&mut self) -> String;
@@ -191,6 +227,12 @@ pub trait KeystoreModuleEvents {
     fn approval_offered(&self, handle: String);
     /// A request reached a terminal state.
     fn approval_settled(&self, handle: String, state: String);
+    /// The signer interface's account event, sent with every `accounts_changed`.
+    fn signer_accounts_changed(&self, count: i64);
+    /// The signer interface's device event. The keystore has no device and never sends it.
+    fn signer_changed(&self, state: String);
+    /// The signer interface's job event. Keystore jobs finish inside `sign` and never send it.
+    fn sign_progress(&self, job: String, state: String);
 }
 
 // The builder injects the generated module-impl scaffold here: `install`,
@@ -204,6 +246,9 @@ struct KeystoreModuleImpl {
     approvals: Approvals,
     /// Who may approve and who may mutate. Defaults from load, replaced by `configure`.
     roles: gate::Roles,
+    /// Keys held by an unlock, in memory only, and the signer interface's jobs.
+    unlocks: Unlocks,
+    jobs: JobTable,
 }
 
 impl KeystoreModuleImpl {
@@ -212,6 +257,19 @@ impl KeystoreModuleImpl {
             .as_mut()
             .ok_or_else(|| "keystore not initialized (context not ready)".to_string())
     }
+    /// The keystore as a signer, over this module's state for one call.
+    fn signer(&mut self) -> std::result::Result<KeystoreSigner<'_>, String> {
+        let ks = self.ks.as_ref().ok_or_else(|| "keystore not initialized (context not ready)".to_string())?;
+        Ok(KeystoreSigner { ks, unlocks: &mut self.unlocks, jobs: &mut self.jobs })
+    }
+
+    /// Both account events: the keystore's own, and the signer interface's.
+    fn announce(&self) {
+        let count = self.account_count();
+        emit_accounts_changed(count);
+        emit_signer_accounts_changed(count);
+    }
+
     /// `-1` means "unknown", not "none": the listing is fallible now, and reporting a
     /// keystore we could not read as an EMPTY one is the exact defect this pass removed
     /// from the layer below. A subscriber that treats -1 as 0 is wrong on purpose.
@@ -253,6 +311,17 @@ impl KeystoreModuleImpl {
     /// registry is refused outright rather than falling through ungated.
     fn may_mutate(&self, method: &str) -> bool {
         gate::tier_d_admits(method, &self.roles.custodians, &Self::caller())
+    }
+
+    /// Tier M: a configured manager, for a method `gate::TIER_M_METHODS` names.
+    fn is_manager(&self, method: &str) -> bool {
+        gate::tier_m_admits(method, &self.roles.managers, &Self::caller())
+    }
+
+    /// Account listings with xpubs, and what is unlocked: the manager and the custodian.
+    fn reads_signer_state(&self) -> bool {
+        let caller = Self::caller();
+        gate::holds_any_role(&self.roles.managers, &caller) || gate::holds_any_role(&self.roles.custodians, &caller)
     }
 
     /// The live caller, reduced to the pure form the gate reasons about.
@@ -361,6 +430,44 @@ struct GroupLabelParams {
 }
 
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UnlockParams {
+    account: String,
+    password: String,
+    #[serde(default)]
+    ttl_ms: Option<u64>,
+    #[serde(default)]
+    count: Option<u32>,
+}
+
+#[derive(Deserialize, Default)]
+struct LockParams {
+    #[serde(default)]
+    account: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DatabaseKeyParams {
+    group: String,
+    #[serde(default)]
+    password: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportBitcoinParams {
+    phrase: String,
+    #[serde(default)]
+    passphrase: String,
+    family: String,
+    chain: String,
+    #[serde(default)]
+    account: u32,
+    password: String,
+    #[serde(default)]
+    label: String,
+}
+
+#[derive(Deserialize)]
 struct RemoveParams {
     path: String,
     #[serde(default, alias = "acknowledgeMayBeKeyMaterial")]
@@ -391,7 +498,7 @@ impl KeystoreModule for KeystoreModuleImpl {
     fn configure(&mut self, config_json: String) -> String {
         match self.roles.configure(&config_json) {
             Ok(()) => json!({ "ok": true, "approvers": self.roles.approvers,
-                              "custodians": self.roles.custodians })
+                              "custodians": self.roles.custodians, "managers": self.roles.managers })
             .to_string(),
             Err(e) => err(e),
         }
@@ -438,7 +545,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(d) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "address": d.address.to_string(), "path": d.path,
                         "group": d.group, "storage": storage.as_str(), "index": d.index,
                         "origin": "derived" })
@@ -466,7 +573,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(d) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 derived_reply(&d)
             }
             Err(e) => err(e),
@@ -495,7 +602,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(d) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 derived_reply(&d)
             }
             Err(e) => err(e),
@@ -550,7 +657,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(addr) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "address": addr.to_string(), "origin": "random" }).to_string()
             }
             Err(e) => err(e),
@@ -572,7 +679,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(f) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "group": f.group, "storage": "plain",
                         "recordUpdated": f.record_updated, "stranded": f.was_stranded,
                         "stagedRemoved": f.staged_removed })
@@ -596,7 +703,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(r) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "group": r.group, "recordRemoved": r.record_removed,
                         "nameRemoved": r.name_removed })
                 .to_string()
@@ -622,6 +729,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "usedPassphrase": g.group.used_passphrase, "label": g.group.label,
                             "accountCount": g.account_count, "derivable": g.derivable,
                             "stranded": g.stranded, "staged": g.staged,
+                            "family": g.group.family, "chain": g.group.chain,
                         })
                     })
                     .collect();
@@ -689,7 +797,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(s) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "swept": s.swept, "promoted": s.promoted,
                         "unexplained": s.left.unexplained_all(), "links": s.left.links,
                         "staged": s.left.staged_vaults, "importStages": s.left.import_stages })
@@ -713,7 +821,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(removed) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "removed": removed }).to_string()
             }
             Err(e) => err(e),
@@ -732,7 +840,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(addr) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "address": addr.to_string() }).to_string()
             }
             Err(e) => err(e),
@@ -752,7 +860,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(addr) => {
-                emit_accounts_changed(self.account_count());
+                self.announce();
                 json!({ "ok": true, "address": addr.to_string() }).to_string()
             }
             Err(e) => err(e),
@@ -781,7 +889,11 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
         match self.ks() {
             Ok(ks) => match ks.change_password(&address, &old_password, &new_password) {
-                Ok(addr) => json!({ "ok": true, "address": addr.to_string() }).to_string(),
+                Ok(addr) => {
+                    // A new password ends an unlock opened with the old one.
+                    self.unlocks.lock(Some(&addr.to_string()));
+                    json!({ "ok": true, "address": addr.to_string() }).to_string()
+                }
                 Err(e) => err(e),
             },
             Err(e) => err(e),
@@ -797,7 +909,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match self.ks() {
             Ok(ks) => match ks.set_label(&address, &label, &password) {
                 Ok(()) => {
-                    emit_accounts_changed(self.account_count());
+                    self.announce();
                     json!({ "ok": true }).to_string()
                 }
                 Err(e) => err(e),
@@ -835,7 +947,7 @@ impl KeystoreModule for KeystoreModuleImpl {
         match self.ks() {
             Ok(ks) => match ks.set_group_label(&req) {
                 Ok(()) => {
-                    emit_accounts_changed(self.account_count());
+                    self.announce();
                     json!({ "ok": true }).to_string()
                 }
                 Err(e) => err(e),
@@ -894,7 +1006,8 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match res {
             Ok(true) => {
-                emit_accounts_changed(self.account_count());
+                self.unlocks.lock(Some(&address));
+                self.announce();
                 true
             }
             _ => false,
@@ -910,7 +1023,8 @@ impl KeystoreModule for KeystoreModuleImpl {
         if self.roles.approvers.is_empty() {
             return not_authorized();
         }
-        match self.approvals.request(&requester, &intent_json) {
+        // The keystore is lent so a Bitcoin request can be read against its wallet.
+        match self.approvals.request_with(self.ks.as_ref(), &requester, &intent_json) {
             Ok((handle, receipt)) => {
                 emit_approval_offered(&handle);
                 json!({ "ok": true, "handle": handle, "receipt": receipt }).to_string()
@@ -1022,6 +1136,172 @@ impl KeystoreModule for KeystoreModuleImpl {
         ok
     }
 
+    fn signer_info(&mut self) -> String {
+        wire::ok(serde_json::to_value(ks_signer::info()).unwrap_or_default())
+    }
+
+    fn signer_accounts(&mut self) -> String {
+        if !self.reads_signer_state() {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::signer_accounts(&mut s),
+            Err(e) => err(e),
+        }
+    }
+
+    fn sign(&mut self, request_json: String) -> String {
+        let request_json = Zeroizing::new(request_json);
+        if !self.is_manager("sign") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::sign(&mut s, &request_json),
+            Err(e) => err(e),
+        }
+    }
+
+    fn sign_status(&mut self, job: String) -> String {
+        if !self.is_manager("sign_status") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::sign_status(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
+    fn sign_result(&mut self, job: String) -> String {
+        if !self.is_manager("sign_result") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::sign_result(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
+    fn cancel_sign(&mut self, job: String) -> String {
+        if !self.is_manager("cancel_sign") {
+            return not_authorized();
+        }
+        match self.signer() {
+            Ok(mut s) => signer_json::cancel_sign(&mut s, &job),
+            Err(e) => err(e),
+        }
+    }
+
+    fn unlock(&mut self, params_json: String) -> String {
+        if !self.is_manager("unlock") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: UnlockParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        let ttl = p.ttl_ms.map(Duration::from_millis);
+        match self.signer() {
+            Ok(mut s) => match s.unlock(&p.account, &password, ttl, p.count) {
+                Ok(v) => json!({ "ok": true, "account": v.account, "expiresInMs": v.expires_in_ms,
+                                 "countLeft": v.count_left })
+                .to_string(),
+                Err(e) => wire::err(&e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn lock(&mut self, params_json: String) -> String {
+        if !self.is_manager("lock") {
+            return not_authorized();
+        }
+        let p: LockParams = if params_json.trim().is_empty() {
+            LockParams::default()
+        } else {
+            match serde_json::from_str(&params_json) {
+                Ok(p) => p,
+                Err(e) => return err(e),
+            }
+        };
+        let locked = self.unlocks.lock(p.account.as_deref());
+        json!({ "ok": true, "locked": locked }).to_string()
+    }
+
+    fn unlocked(&mut self) -> String {
+        if !self.reads_signer_state() {
+            return not_authorized();
+        }
+        let list: Vec<_> = self
+            .unlocks
+            .list()
+            .into_iter()
+            .map(|v| json!({ "account": v.account, "expiresInMs": v.expires_in_ms, "countLeft": v.count_left }))
+            .collect();
+        json!({ "ok": true, "unlocked": list }).to_string()
+    }
+
+    fn database_key(&mut self, params_json: String) -> String {
+        if !self.is_manager("database_key") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: DatabaseKeyParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = p.password.map(Zeroizing::new);
+        match self.signer() {
+            Ok(mut s) => match s.database_key(&p.group, password.as_ref().map(|pw| pw.as_str())) {
+                Ok(key) => json!({ "ok": true, "group": p.group, "databaseKey": key.as_str() }).to_string(),
+                Err(e) => wire::err(&e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn import_bitcoin(&mut self, params_json: String) -> String {
+        if !self.may_mutate("import_bitcoin") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: ImportBitcoinParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let (phrase, passphrase, password) =
+            (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (family, chain) = match (BtcFamily::parse(&p.family), BtcChain::parse(&p.chain)) {
+            (Ok(f), Ok(c)) => (f, c),
+            (Err(e), _) | (_, Err(e)) => return err(e),
+        };
+        let req = BitcoinImport {
+            phrase: &phrase,
+            bip39_passphrase: &passphrase,
+            family,
+            chain,
+            account: p.account,
+            password: &password,
+            label: &p.label,
+        };
+        let res = match self.ks() {
+            Ok(ks) => ks.import_bitcoin(&req),
+            Err(e) => return err(e),
+        };
+        match res {
+            Ok(g) => {
+                self.announce();
+                json!({ "ok": true, "group": g.id, "family": family.as_str(), "chain": chain.as_str(),
+                        "path": format!("m/{}", g.account.origin().to_string().trim_start_matches("m/")),
+                        "fingerprint": g.account.fingerprint.to_string(),
+                        "external": g.account.descriptor(0), "internal": g.account.descriptor(1) })
+                .to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
     fn caller_identity(&mut self) -> String {
         let c = logos_rust_sdk::current_caller();
         let (kind, name) = match &c {
@@ -1032,7 +1312,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
         json!({ "ok": true, "kind": kind, "identity": name,
-                "approvers": self.roles.approvers, "custodians": self.roles.custodians })
+                "approvers": self.roles.approvers, "custodians": self.roles.custodians, "managers": self.roles.managers })
         .to_string()
     }
 }

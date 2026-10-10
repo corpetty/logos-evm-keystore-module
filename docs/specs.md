@@ -208,7 +208,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
-| `configure` | `config_json: String` | `{ ok, approvers, custodians }` | no — sets who may |
+| `configure` | `config_json: String` | `{ ok, approvers, custodians, managers }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
@@ -242,14 +242,25 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, claim_lines, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
-| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
+| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, managers }` | no |
+| `signer_info` | — | `{ ok, interface, kind, model, families, requestKinds, showsRequest, collects }` | no |
+| `signer_accounts` | — | `{ ok, accounts: [..] }` | no |
+| `sign` | `request_json: String` | `{ ok, job }` | no |
+| `sign_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
+| `sign_result` | `job: String` | `{ ok, job, signatures: [..] }` | no |
+| `cancel_sign` | `job: String` | `{ ok, job }` | no |
+| `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
+| `lock` | `params_json: String` | `{ ok, locked }` | no |
+| `unlocked` | — | `{ ok, unlocked: [..] }` | no |
+| `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
+| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal }` | yes → event |
 
 ---
 
 ### `configure(config_json: String) -> String`
 
-Name who holds the two roles. `config_json` is `{ approvers?, custodians? }`; the reply is
-`{ ok, approvers, custodians }` echoing what is now in force, or the usual
+Name who holds the three roles. `config_json` is `{ approvers?, custodians?, managers? }`; the
+reply is `{ ok, approvers, custodians, managers }` echoing what is now in force, or the usual
 `{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
 
 **A role is a set.** Each key takes one name or a list of them, because a terminal signer
@@ -272,7 +283,7 @@ the total rule a typo (`custodain`) would otherwise empty **both** roles: fail-c
 silent about why everything started refusing.
 
 **Until it is called, the built-in defaults stand** — `evm_signer_ui` approves, `evm_keystore_ui`
-mutates. A module nobody configures is not inert.
+mutates, `signer_manager_module` asks for signatures. A module nobody configures is not inert.
 
 #### It is deliberately ungated, for now
 
@@ -1061,14 +1072,175 @@ logosctl call keystore_module remove_unexplained '{"path":"backup.json","acknowl
 
 ---
 
+## Bitcoin wallets (BIP84, BIP86)
+
+*Phase K0 of the Shared Keystore Plan: the core is here and is reached through `request_approval`
+and `approve`. Creating Bitcoin wallets over IPC, opening them for a wallet and unlocking them
+come in K1.*
+
+A Bitcoin wallet is a derivation group of one **family**, on one **chain**:
+
+| Family | Path | Script | Descriptor |
+|---|---|---|---|
+| `bitcoin` | `m/84'/c'/a'` (BIP84) | P2WPKH, native segwit | `wpkh([fp/84'/c'/a']xpub/0/*)` and `/1/*` |
+| `bitcoin_taproot` | `m/86'/c'/a'` (BIP86) | P2TR, key path only | `tr([fp/86'/c'/a']xpub/0/*)` and `/1/*` |
+
+`c` is 0 on the `main` chain and 1 on `test`, which covers testnet, testnet4, signet and
+regtest. Like the EVM path, neither is editable: `btc::parse_account_path` refuses any other
+purpose, coin type or depth, so a hand-edited record cannot redirect derivation. A request names
+its network, and a test wallet never signs for mainnet or the other way round.
+
+**What is kept.** The group's vault, at `groups/<id>.json` like an EVM group's derivation key,
+holds a JSON document inside the same scrypt envelope:
+`{ v: 1, family, accountKey, databaseKey }`. `accountKey` is the account-level xprv or tprv,
+the deepest key the wallet keeps; the root is never stored. `databaseKey` is 32 random bytes,
+generated with the group and derived from nothing, for the wallet core's encrypted database.
+The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
+but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
+EVM records are written exactly as before; those fields are absent from them.
+
+`account_descriptors(group)` (a library call in K0) returns both descriptors with their BIP380
+checksums. A Bitcoin wallet never exports a child key, which is what keeps showing its xpub
+safe; EVM groups still expose no xpub. EVM derivation refuses a Bitcoin group by name, and
+`forget_derivation` refuses one, because its vault holds the wallet's only key.
+
+**What the keystore checks before showing a PSBT.** Every input must be this wallet's: an
+entry in `bip32_derivation` (or `tap_key_origins` with the internal key) carrying this
+wallet's master fingerprint and a path under its account, whose derived key is the one named
+and whose script is the one spent. Refused, whole:
+
+* an input of another wallet, or one naming this wallet's keys twice;
+* a native segwit input without its previous transaction, a previous transaction that is not
+  the one spent, or an amount that disagrees with it. A segwit v0 signature commits only to
+  its own input's amount, which is the 2020 fee attack; a taproot signature commits to every
+  input's, so a false amount there signs nothing that can spend;
+* a sighash other than ALL, or DEFAULT for taproot;
+* a script path, a redeem or witness script, or an input already signed;
+* outputs worth more than the inputs, or a coin spent twice, which the fee would count twice.
+
+An output counts as this wallet's only if deriving the path it claims gives its script;
+anything else is shown as a send. The fee is the keystore's own sum, inputs minus outputs,
+and the rate beside it assumes the largest signatures, so it is never above the real one.
+
+```
+Wallet: "Savings"
+Commitment: 3b0c…
+1 item(s) to sign:
+  [1] Bitcoin signet · wallet "Savings", native segwit, account 0
+      Send 0.01500000 BTC to tb1q…
+      Change 0.00481234 BTC back to this wallet (m/84'/1'/0'/1/7, checked)
+      Fee 2,190 sats, about 14.1 sat/vB, computed from the inputs
+      Spends 2 coins worth 0.01983424 BTC · replaceable (RBF)
+```
+
+**Commitment and signing.** The commitment is SHA-256 over the consensus encoding of the
+unsigned transaction and, per input, the amount, script, path and sighash shown, and per
+output whether it is this wallet's and at which path. `approve` reads the PSBT again, checks
+the commitment, opens the vault with the password, refuses a vault whose key is not the one
+the record's xpub describes, and signs with rust-bitcoin's `Psbt::sign`: ECDSA for native
+segwit, BIP340 Schnorr with auxiliary randomness for taproot. The key lookup is our own,
+because rust-bitcoin's lookup for an `Xpriv` matches only a master key or the level below.
+
+**Residual.** rust-bitcoin's `Xpriv` is `Copy` and has no `Zeroize`, so derivation leaves
+copies of keys and chain codes the module cannot wipe; `AccountSecret` wipes its own on drop.
+
+## The keystore as a signer (`logos.signer/1`)
+
+The keystore implements [`logos.signer/1`](https://github.com/logos-co/logos-signer-interface),
+the contract every signer module implements, so the signer manager (`signer_manager_module`) can
+list its accounts and have it sign beside each hardware wallet's module. It signs **hashes only**:
+the manager reads, renders and commits to every request, computes each digest, and checks every
+signature against the account's public material before anything settles. The keystore parses no
+request on this path. The approval flow below keeps working until its last caller has moved to the
+manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conformance suite.
+
+### Who may call
+
+| Methods | Admits |
+|---|---|
+| `signer_info` | anyone: it describes the kind of signer, not an account |
+| `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `import_bitcoin` | a configured **custodian** (Tier D) |
+
+Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `unlock`: the
+manager keeps which apps an unlock covers and whether each signature is still confirmed, so a
+module that could reach `sign` past it would sign inside an unlock it was never granted.
+
+### `signer_info() -> String`
+
+`{ ok, interface: "logos.signer/1", kind: "keystore", model: "scrypt key files", families: ["evm",
+"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password" }`.
+
+### `signer_accounts() -> String`
+
+Every account as public material. An EVM account: `{ id: <address>, family: "evm", address, path?,
+label?, available: true }`, `path` only for a derived one. A Bitcoin wallet: `{ id: <group>, family:
+"bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'", fingerprint, xpub,
+label?, available: true }`.
+
+### `sign(request_json: String) -> String`
+
+`{ account, kind: "hash", items: [{ path?, scheme, digest }], secret? }` → `{ ok, job }`. Every item
+is checked against the account **before any vault opens**: an EVM account takes scheme `evm` and
+no path, and signs with its own key; a native segwit wallet takes `ecdsa` and a Bitcoin wallet's
+receive or change path (`m/84'/c'/a'/0|1/i`); a taproot wallet takes `bip86`. With `secret`, the
+vault opens with that password for this request only; without it, the account's unlock answers,
+and one request counts once against it however many items it carries. A wrong password is
+`wrong_secret`, one message for every way a vault fails to open, as `set_label` gives; no secret
+and no unlock is `locked`. Signatures are 64 bytes `r‖s` with low S, `recoveryId` for EVM, and
+the signing key (33 bytes, or 32 x-only for taproot) as `pubkey`.
+
+### `sign_status(job: String) -> String`, `sign_result(job: String) -> String`, `cancel_sign(job: String) -> String`
+
+A keystore job finishes inside `sign`, so `sign_status` answers `done` (or `failed` with its
+`code`) at once, and `sign_result` returns the signatures until the job is swept, ten minutes
+after it settled. `cancel_sign` is harmless on a settled job.
+
+### `unlock(params_json: String) -> String`, `lock(params_json: String) -> String`, `unlocked() -> String`
+
+`unlock` takes `{ account, password, ttlMs?, count? }` and holds the account's key in memory until
+`ttlMs` passes or `count` requests are signed — whichever comes first; neither means until it is
+locked. It answers `{ ok, account, expiresInMs, countLeft }`. `lock` takes `{ account? }` and locks
+that account, or every account for `{}`, answering `{ ok, locked: <how many> }`. `unlocked` lists
+`{ account, expiresInMs, countLeft }`.
+
+These are **not** the methods keystore#6 deleted. That `unlock` was callable by any module and
+its only caller passed `ttl: None`, so it never expired and nobody had chosen that. This one
+answers the manager alone, which takes the terms from a person in the keys app; the keystore
+enforces the time and the count, the manager the apps and the confirmation. A new password and a
+deleted account end the account's unlock, and nothing about an unlock is written to disk.
+
+### `database_key(params_json: String) -> String`
+
+`{ group, password? }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
+wallet core's database, for an open request the keys app approved. With `password` the vault
+opens; without it, the wallet's unlock answers, and opening uses no count.
+
+### `import_bitcoin(params_json: String) -> String`
+
+`{ phrase, passphrase?, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", account?,
+password, label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`, the
+two descriptors with their checksums. Tier D. See [Bitcoin wallets](#bitcoin-wallets-bip84-bip86).
+
+### Events
+
+`signer_accounts_changed` goes out with every `accounts_changed`, with the same count, from one helper, so the
+two cannot drift; `rust-lib/tests/every_displayed_mutation_announces_itself.rs` checks both.
+`signer_changed` and `sign_progress` are part of the interface; the keystore has no device and
+finishes its jobs inside `sign`, so it never sends them.
+
+---
+
 ## Human-approved signing
 
-There is **no way to make this module sign anything except by a human approving
-it.** The methods that used to sign on demand — `unlock`, `timed_unlock`, `lock`,
-`is_unlocked`, `sign_transaction`, `sign_message`, `sign_digest` — are **deleted
-from the contract**, not merely gated. There is no unlocked-signer cache: the
-signing key is derived from the vault password *inside* `approve()`, used, and
-zeroized before the call returns.
+There is **no way to make this module sign anything except by a person's approval**: of the
+request, or of an unlock whose terms cover it. The methods that used to sign on demand —
+`timed_unlock`, `is_unlocked`, `sign_transaction`, `sign_message`, `sign_digest`, and the
+`unlock` and `lock` keystore#6 removed — are **deleted from the contract**, not merely gated. On
+this path the signing key is derived from the vault password *inside* `approve()`, used, and
+zeroized before the call returns. The signer interface's `unlock` (above) answers the manager
+alone, on terms a person set.
 
 ### The three tiers
 
@@ -1080,7 +1252,8 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin` | a configured **custodian** (default `evm_keystore_ui`) |
+| **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
 names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
@@ -1364,6 +1537,16 @@ The intent is `{ address, purpose, legs: [...] }`, where each leg is one of:
 { "kind": "typed_data", "typed_data": { "types": …, "primaryType": "…", "domain": …, "message": … } }
 ```
 
+A Bitcoin request names a `group` instead of an `address` and carries exactly one leg:
+
+```jsonc
+{ "group": "g_…", "purpose": "…", "legs": [ { "kind": "psbt", "network": "regtest", "psbt": "cHNidP8B…" } ] }
+```
+
+The keystore reads the PSBT against that wallet before anything is shown, and refuses it whole
+on any input it would not sign; see [Bitcoin wallets](#bitcoin-wallets-bip84-bip86). An intent
+names exactly one of `address` and `group`, and a `psbt` leg never rides with an EVM leg.
+
 A `typed_data` leg is EIP-712, in the standard's own JSON. It is **not** opaque: the
 module parses it with alloy's implementation of the standard, computes the signing
 hash itself — never trusting one from the requester — and renders the domain, the
@@ -1394,7 +1577,8 @@ Limits: at most 4 pending per requester, 16 total, 64 KiB of intent.
 ### `fetch_result(handle: String, receipt: String) -> String`
 
 **Tier B.** Collect the signatures: `{ ok, signed: [ … ] }`, one entry per leg in
-request order. Idempotent until `ack_result`.
+request order. Idempotent until `ack_result`. For a `psbt` leg the entry is the PSBT, base64,
+with this wallet's signatures added and its unsigned transaction untouched.
 
 ### `ack_result(handle: String, receipt: String) -> bool`
 
@@ -1467,11 +1651,12 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approvers, custodians }` where `kind` is one
-of `unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, approvers, custodians, managers }` where `kind`
+is one of `unknown` | `host` | `module` | `derived` | `operator`.
 
-`approvers` and `custodians` are the names currently in force — the built-in defaults, or
-whatever `configure` last set. An **empty** list means that role is held by nobody and every
+`approvers`, `custodians` and `managers` are the names currently in force — the built-in
+defaults, or whatever `configure` last set. They are everything a total `configure` has to
+repeat: a document built from the first two alone would leave the manager unable to sign. An **empty** list means that role is held by nobody and every
 method of its tier refuses, which is what this field exists to make visible. (It used to
 carry a `configError` naming an unreadable `keystore.json`; there is no config file any
 more, so that state cannot occur and the field is gone.)
@@ -1753,7 +1938,16 @@ pub struct Keystore {
 }
 ```
 
-**There is no unlocked-signer cache, by construction.** A decrypted key exists only
+**Unlocked keys live in one place: `signer::Unlocks`.** An unlock the manager asked for holds the
+account's private key, or a Bitcoin wallet's account key and database key, in a buffer locked into
+RAM where the system allows it (`mlock`, `VirtualLock`), and on Linux the process stops writing core
+dumps once one exists. The buffer is wiped when the unlock ends: on its time or count, on `lock`,
+on a password change, or when the account is deleted. Each signature rebuilds the key from it for
+that one call. Nothing about an unlock is written to disk, and a restart locks everything. The
+signer interface's job table holds signatures, never keys, and forgets them ten minutes after a
+job settles.
+
+**Outside an unlock there is no signer cache, by construction.** A decrypted key exists only
 as a local inside `approve()`: derived from the vault password, used to sign every
 leg of the bundle, then zeroized (`Zeroizing` wraps the password, the derived key
 and the signer's key bytes) before the call returns. Nothing outside that call
@@ -1923,6 +2117,31 @@ The CI workflow resolves the commit under test and passes
 `--release-for logos-evm-keystore-module=<sha>` so the spec's `{release}`
 placeholder builds the PR's own code, then publishes a two-column HTML report to
 GitHub Pages.
+
+### Exported symbols
+
+On macOS and Linux the plugin exports only `qt_plugin_instance` and
+`qt_plugin_query_metadata_v2`, as it does on Windows (`exports/`, applied in `CMakeLists.txt`).
+Without the list it exported about 7,000 symbols, the Rust core's and the statically linked
+SDK's among them, and rust-bitcoin added libsecp256k1's 69 C functions.
+
+```bash
+nix build .#lib && nm -gU result/lib/keystore_module_plugin.dylib   # 2 symbols
+```
+
+### Regtest proof (Bitcoin)
+
+`tools/regtest` is its own crate and lock, so BDK never enters the module's build. It starts a
+regtest `bitcoind`, builds a BDK wallet from the keystore's descriptors, funds it, has BDK build
+a send, and runs it through `request_approval`, `acknowledge`, `approve` and `fetch_result`. It
+checks the fee line against BDK's fee, that a forged change output is shown as a send, that a
+false input amount is refused (native segwit) or produces a signature `bitcoind` rejects
+(taproot), and that `bitcoind` accepts and mines the honest send, for both families.
+
+```bash
+cd tools/regtest
+BITCOIND_EXE=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind cargo run --release
+```
 
 ### Unit tests (crypto core)
 

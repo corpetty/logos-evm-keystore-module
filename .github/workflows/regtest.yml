@@ -1,0 +1,45 @@
+name: Bitcoin regtest
+
+# BDK builds PSBTs from the keystore's descriptors, the keystore reads and signs them, and a
+# regtest bitcoind has to accept the sends (tools/regtest). Pinned nixpkgs: Bitcoin Core 31.1.
+
+on:
+  pull_request:
+    branches: [master, main]
+  push:
+    branches: [master, main]
+
+concurrency:
+  group: regtest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regtest:
+    name: regtest sends (native segwit, taproot)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the pinned toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: "1.89"
+
+      - name: Provide the SDK manifest cargo insists on resolving
+        # As in unit-tests.yml: resolved, never compiled without the logos_module feature.
+        uses: actions/checkout@v4
+        with:
+          repository: logos-co/logos-rust-sdk
+          path: logos-rust-sdk-src
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tools/regtest
+
+      - uses: cachix/install-nix-action@v31
+
+      - name: Sign and broadcast on regtest
+        run: |
+          bitcoind=$(nix build github:NixOS/nixpkgs/39ad350a0602fa0a58a544344e3e9187526ea45c#bitcoind --no-link --print-out-paths)/bin/bitcoind
+          cd tools/regtest
+          BITCOIND_EXE="$bitcoind" cargo run --release --locked
