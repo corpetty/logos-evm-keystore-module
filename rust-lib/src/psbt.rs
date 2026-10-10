@@ -45,6 +45,11 @@ pub fn check<C: Verification>(
     if tx.input.is_empty() || tx.output.is_empty() {
         return Err(bad("a transaction needs inputs and outputs"));
     }
+    // A coin spent twice would be counted twice in the fee shown.
+    let mut spent = std::collections::BTreeSet::new();
+    if !tx.input.iter().all(|i| spent.insert(i.previous_output)) {
+        return Err(bad("a coin is spent twice"));
+    }
     let mut canonical = b"psbt\n".to_vec();
     canonical.extend_from_slice(network.to_core_arg().as_bytes());
     canonical.push(b'\n');
@@ -533,6 +538,16 @@ pub(crate) mod tests {
         let mut psbt = sample(&acct);
         psbt.inputs[1].final_script_witness = Some(Witness::new());
         assert!(checked(&acct, &psbt).is_err());
+    }
+
+    #[test]
+    fn a_coin_spent_twice_is_refused() {
+        let (_, acct) = account(ABANDON, Family::Segwit);
+        let mut psbt = sample(&acct);
+        psbt.unsigned_tx.input[1].previous_output = psbt.unsigned_tx.input[0].previous_output;
+        psbt.inputs[1] = psbt.inputs[0].clone();
+        let e = checked(&acct, &psbt).unwrap_err().to_string();
+        assert!(e.contains("spent twice"), "{e}");
     }
 
     #[test]

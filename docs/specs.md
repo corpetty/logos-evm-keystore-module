@@ -1105,7 +1105,7 @@ and whose script is the one spent. Refused, whole:
   input's, so a false amount there signs nothing that can spend;
 * a sighash other than ALL, or DEFAULT for taproot;
 * a script path, a redeem or witness script, or an input already signed;
-* outputs worth more than the inputs.
+* outputs worth more than the inputs, or a coin spent twice, which the fee would count twice.
 
 An output counts as this wallet's only if deriving the path it claims gives its script;
 anything else is shown as a send. The fee is the keystore's own sum, inputs minus outputs,
