@@ -1,0 +1,19 @@
+[package]
+name = "keystore-regtest"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+publish = false
+description = "Signs BDK-built PSBTs with keystore_module and broadcasts them to a regtest bitcoind."
+
+# Its own workspace and lock, so BDK never enters the module's build.
+[workspace]
+resolver = "3"
+
+[dependencies]
+keystore_module = { path = "../../rust-lib", default-features = false }
+bdk_wallet = "3.2.0"
+ureq = { version = "2", default-features = false }
+serde_json = "1"
+tempfile = "3"
+base64 = "0.22"

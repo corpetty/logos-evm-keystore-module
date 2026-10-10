@@ -27,7 +27,7 @@ pub mod ack;
 pub mod hd;
 
 pub use ack::Unrecoverable;
-pub use keystore::{Keystore, KeystoreError};
+pub use keystore::{BitcoinGroup, BitcoinImport, Keystore, KeystoreError};
 
 // The Logos module contract + glue. Feature-gated so the crypto core above can
 // be exercised with `cargo test --no-default-features`; the builder compiles it
