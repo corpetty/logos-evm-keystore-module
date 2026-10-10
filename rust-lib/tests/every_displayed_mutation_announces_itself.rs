@@ -53,6 +53,7 @@ const SILENT: &[&str] = &[
     // Showing a kept phrase moves nothing; the list of them is a read.
     "show_phrase",
     "list_phrases",
+    "account_descriptors",
     // The signer interface: signing and unlocking move no account a reader shows.
     "signer_info",
     "signer_accounts",

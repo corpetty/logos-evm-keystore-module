@@ -257,6 +257,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `show_phrase` | `params_json: String` | `{ ok, phrase, words }` | no |
 | `forget_phrase` | `params_json: String` | `{ ok, forgotten }` | yes → event |
 | `list_phrases` | — | `{ ok, phrases: [{ id, groups, staged }] }` | no |
+| `account_descriptors` | `params_json: String` | `{ ok, group, external, internal }` | no |
 
 ---
 
@@ -1106,7 +1107,8 @@ The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. T
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
 EVM records are written exactly as before; those fields are absent from them.
 
-`account_descriptors(group)` (a library call in K0) returns both descriptors with their BIP380
+`account_descriptors` (`{ group }`, for the configured manager or custodian, so the keys app can
+show a wallet's descriptor with its warning) returns both descriptors with their BIP380
 checksums. A Bitcoin wallet never exports a child key, which is what keeps showing its xpub
 safe; EVM groups still expose no xpub. EVM derivation refuses a Bitcoin group by name, and
 `forget_derivation` refuses one, because its vault holds the wallet's only key.
@@ -1170,6 +1172,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 | `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `show_phrase`, `forget_phrase` | a configured **custodian** (Tier D) |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
+| `account_descriptors` | a configured **manager** or **custodian**: a descriptor's xpub shows the wallet's whole history |
 
 Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `unlock`: the
 manager keeps which apps an unlock covers and whether each signature is still confirmed, so a

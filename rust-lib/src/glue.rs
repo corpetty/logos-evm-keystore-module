@@ -214,6 +214,9 @@ pub trait KeystoreModule: Send + 'static {
     fn forget_phrase(&mut self, params_json: String) -> String;
     /// Every kept phrase: `{ ok, phrases: [{ id, groups, staged }] }`. Ungated: ids only.
     fn list_phrases(&mut self) -> String;
+    /// A Bitcoin wallet's descriptors, for the keys app to show: `{ group }` → `{ ok, group,
+    /// external, internal }`. The custodian and the manager: an xpub shows the whole history.
+    fn account_descriptors(&mut self, params_json: String) -> String;
 
     /// Observability: what this module currently sees as its caller. Ungated
     /// and side-effect-free — identity cannot report its own absence.
@@ -1378,6 +1381,26 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(forgotten) => {
                 self.announce();
                 json!({ "ok": true, "forgotten": forgotten }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn account_descriptors(&mut self, params_json: String) -> String {
+        if !self.reads_signer_state() {
+            return not_authorized();
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            group: String,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(e),
+        };
+        match self.ks().and_then(|ks| ks.account_descriptors(&w.group).map_err(|e| e.to_string())) {
+            Ok((external, internal)) => {
+                json!({ "ok": true, "group": w.group, "external": external, "internal": internal }).to_string()
             }
             Err(e) => err(e),
         }
