@@ -478,6 +478,7 @@ mod tests {
                 password: "pw",
                 label: "",
                 keep: crate::keystore::KeepPhrase::No,
+                start: crate::keystore::WalletStart::Restored(None),
             })
             .unwrap();
         }

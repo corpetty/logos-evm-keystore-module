@@ -892,6 +892,12 @@ pub struct Group {
     /// The kept phrase this wallet was made from, when the person chose to keep it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phrase: Option<String>,
+    /// `created` or `restored`, Bitcoin groups only; see [`WalletStart`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// The first day the wallet could have received coins, `YYYY-MM-DD` in UTC, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<String>,
 }
 
 /// Where one account came from. Kept beside the vaults for the same reason labels are: a
@@ -1187,6 +1193,59 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+const DAY_MS: u64 = 86_400_000;
+
+/// A UTC day as `YYYY-MM-DD`, from milliseconds since 1970.
+fn utc_day(ms: u64) -> String {
+    let (y, m, d) = civil_from_days((ms / DAY_MS) as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// A birthday the person gave: a real day as `YYYY-MM-DD`, from Bitcoin's first block to tomorrow
+/// in UTC, since the person's day may run ahead of it.
+fn check_birthday(day: &str) -> Result<()> {
+    let bad = || KeystoreError::InvalidParams(format!("birthday must be a day as YYYY-MM-DD, from 2009-01-03 on: {day:?}"));
+    let parts: Vec<&str> = day.split('-').collect();
+    let [y, m, d] = parts.as_slice() else { return Err(bad()) };
+    if y.len() != 4 || m.len() != 2 || d.len() != 2 || !parts.iter().all(|p| p.bytes().all(|c| c.is_ascii_digit())) {
+        return Err(bad());
+    }
+    let (y, m, d): (i64, u32, u32) = (y.parse().map_err(|_| bad())?, m.parse().map_err(|_| bad())?, d.parse().map_err(|_| bad())?);
+    let days = days_from_civil(y, m, d);
+    if !(1..=12).contains(&m) || civil_from_days(days) != (y, m, d) {
+        return Err(bad());
+    }
+    if days < days_from_civil(2009, 1, 3) || days > (now_ms() / DAY_MS) as i64 + 1 {
+        return Err(bad());
+    }
+    Ok(())
+}
+
+/// Days since 1970-01-01 of a Gregorian date, by Howard Hinnant's `days_from_civil`.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (i64::from(m) + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// The Gregorian date of a day counted from 1970-01-01, by Howard Hinnant's `civil_from_days`.
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = (if z >= 0 { z } else { z - 146_096 }) / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = yoe + era * 400;
+    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 impl Keystore {
@@ -1653,6 +1712,8 @@ impl Keystore {
             fingerprint: None,
             xpub: None,
             phrase: phrase.clone(),
+            origin: None,
+            birthday: None,
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
@@ -1950,6 +2011,8 @@ impl Keystore {
                     fingerprint: None,
                     xpub: None,
                     phrase: None,
+                    origin: None,
+                    birthday: None,
                 },
                 used_indices: Vec::new(),
                 account_count,
@@ -2044,6 +2107,16 @@ pub struct BitcoinImport<'a> {
     pub password: &'a str,
     pub label: &'a str,
     pub keep: KeepPhrase<'a>,
+    pub start: WalletStart<'a>,
+}
+
+/// Where a Bitcoin wallet's history can begin, for its wallet core to know where to start scanning.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletStart<'a> {
+    /// The keys app made its phrase for it: no coin can have reached it before the day it is made.
+    Created,
+    /// Its phrase came from elsewhere or was kept earlier: the person may give the day it was first used.
+    Restored(Option<&'a str>),
 }
 
 /// Whether a wallet's phrase is kept. The BIP39 passphrase never is.
@@ -2090,6 +2163,15 @@ impl Keystore {
             return Err(KeystoreError::InvalidParams("a Bitcoin wallet's vault needs a password".into()));
         }
         check_displayable(req.label, "label")?;
+        match (req.start, req.keep) {
+            (WalletStart::Created, KeepPhrase::Kept(_)) => {
+                return Err(KeystoreError::InvalidParams(
+                    "a wallet from a kept phrase is restored: the phrase is older than the wallet".into(),
+                ));
+            }
+            (WalletStart::Restored(Some(day)), _) => check_birthday(day)?,
+            _ => {}
+        }
         let secp = bitcoin::secp256k1::Secp256k1::new();
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let (secret, fingerprint) =
@@ -2117,6 +2199,11 @@ impl Keystore {
         let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
 
         let id = new_group_id();
+        let created_ms = now_ms();
+        let (origin, birthday) = match req.start {
+            WalletStart::Created => ("created", Some(utc_day(created_ms))),
+            WalletStart::Restored(day) => ("restored", day.map(str::to_string)),
+        };
         let record = Group {
             storage: Storage::Extkey,
             path_prefix: format!("m/{}'/{}'/{}'", req.family.purpose(), req.chain.coin_type(), req.account),
@@ -2124,12 +2211,14 @@ impl Keystore {
             retired: Vec::new(),
             used_passphrase: !req.bip39_passphrase.is_empty(),
             label: String::new(),
-            created_ms: now_ms(),
+            created_ms,
             family: Some(req.family.as_str().into()),
             chain: Some(req.chain.as_str().into()),
             fingerprint: Some(fingerprint.to_string()),
             xpub: Some(account.xpub.to_string()),
             phrase: phrase.clone(),
+            origin: Some(origin.into()),
+            birthday,
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
@@ -2177,6 +2266,14 @@ impl Keystore {
             .filter(|l| !l.trim().is_empty() && check_displayable(l, "label").is_ok())
             .map_or_else(|| id.to_string(), |l| format!("\"{}\"", l.trim()));
         Ok((AccountPublic { family, chain, account, fingerprint, xpub }, name))
+    }
+
+    /// How a Bitcoin wallet came to be, and its birthday if known. A record from before either was
+    /// kept says `restored`, with no birthday, so its wallet core scans the most.
+    pub fn bitcoin_start(&self, id: &str) -> Result<(String, Option<String>)> {
+        self.bitcoin_account(id)?;
+        let g = self.get_groups()?.remove(id).ok_or_else(|| KeystoreError::NotFound(format!("group {id}")))?;
+        Ok((g.origin.unwrap_or_else(|| "restored".into()), g.birthday))
     }
 
     /// The descriptors a wallet core builds its watch-only wallet from: receive, then change.
@@ -2965,6 +3062,7 @@ mod tests {
             password: "pw",
             label: "Savings",
             keep: crate::keystore::KeepPhrase::No,
+            start: crate::keystore::WalletStart::Restored(None),
         })
         .unwrap()
     }
@@ -2991,6 +3089,71 @@ mod tests {
         assert!(record.contains("\"family\": \"bitcoin\""), "{record}");
     }
 
+    fn bitcoin_import_starting(ks: &Keystore, start: WalletStart, keep: KeepPhrase) -> Result<BitcoinGroup> {
+        ks.import_bitcoin(&BitcoinImport {
+            phrase: TEST_MNEMONIC,
+            bip39_passphrase: "",
+            family: Family::Taproot,
+            chain: Chain::Test,
+            account: 0,
+            password: "pw",
+            label: "",
+            keep,
+            start,
+        })
+    }
+
+    #[test]
+    fn a_bitcoin_wallet_records_where_its_history_can_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        // A wallet whose phrase was made for it starts the day it is made, by the keystore's clock.
+        let made = bitcoin_import_starting(&ks, WalletStart::Created, KeepPhrase::No).unwrap();
+        let record = ks.get_groups().unwrap()[&made.id].clone();
+        assert_eq!(record.birthday, Some(utc_day(record.created_ms)));
+        assert_eq!(ks.bitcoin_start(&made.id).unwrap(), ("created".to_string(), record.birthday));
+
+        let dated = bitcoin_import_starting(&ks, WalletStart::Restored(Some("2021-11-14")), KeepPhrase::No).unwrap();
+        assert_eq!(ks.bitcoin_start(&dated.id).unwrap(), ("restored".to_string(), Some("2021-11-14".to_string())));
+        let undated = bitcoin_import_starting(&ks, WalletStart::Restored(None), KeepPhrase::New("pp")).unwrap();
+        assert_eq!(ks.bitcoin_start(&undated.id).unwrap(), ("restored".to_string(), None));
+
+        // A kept phrase is older than any wallet made from it later.
+        let kept = ks.get_groups().unwrap()[&undated.id].phrase.clone().unwrap();
+        let from_kept = bitcoin_import_starting(&ks, WalletStart::Created, KeepPhrase::Kept(&kept));
+        assert!(matches!(from_kept, Err(KeystoreError::InvalidParams(_))), "{from_kept:?}");
+
+        // Only a real day from the first block on, and not after tomorrow.
+        let before = ks.get_groups().unwrap().len();
+        for day in ["2023-02-30", "2008-12-31", "2009-1-03", "2009/01/03", "2021-13-01", "2021-01-00", "+021-01-01", "", "2999-01-01"] {
+            let r = bitcoin_import_starting(&ks, WalletStart::Restored(Some(day)), KeepPhrase::No);
+            assert!(matches!(r, Err(KeystoreError::InvalidParams(_))), "{day:?}: {r:?}");
+        }
+        assert_eq!(ks.get_groups().unwrap().len(), before, "a refused birthday records nothing");
+        assert!(bitcoin_import_starting(&ks, WalletStart::Restored(Some("2009-01-03")), KeepPhrase::No).is_ok());
+
+        // A record from before birthdays were kept scans the most.
+        ks.update(&ks.groups_path(), |gs: &mut BTreeMap<String, Group>| {
+            let g = gs.get_mut(&dated.id).unwrap();
+            (g.origin, g.birthday) = (None, None);
+        })
+        .unwrap();
+        assert_eq!(ks.bitcoin_start(&dated.id).unwrap(), ("restored".to_string(), None));
+        assert!(ks.bitcoin_start("g_00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn days_and_dates_agree_both_ways() {
+        assert_eq!(utc_day(0), "1970-01-01");
+        assert_eq!(utc_day(1_231_006_505_000), "2009-01-03", "the genesis block's time");
+        assert_eq!(utc_day(1_709_164_800_000), "2024-02-29");
+        assert_eq!(days_from_civil(2009, 1, 3), 14_247);
+        for z in (-1_000_000..1_000_000).step_by(7) {
+            let (y, m, d) = civil_from_days(z);
+            assert_eq!(days_from_civil(y, m, d), z, "{y}-{m}-{d}");
+        }
+    }
+
     fn bitcoin_import_keeping(ks: &Keystore, phrase: &str, passphrase: &str, keep: KeepPhrase) -> Result<BitcoinGroup> {
         ks.import_bitcoin(&BitcoinImport {
             phrase,
@@ -3001,6 +3164,7 @@ mod tests {
             password: "pw",
             label: "",
             keep,
+            start: WalletStart::Restored(None),
         })
     }
 
@@ -3043,6 +3207,7 @@ mod tests {
                 password: "pw",
                 label: "",
                 keep: KeepPhrase::Kept(&id),
+                start: WalletStart::Restored(None),
             })
             .unwrap();
         let mut both = vec![first.id.clone(), second.id.clone()];
