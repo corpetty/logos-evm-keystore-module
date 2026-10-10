@@ -49,11 +49,24 @@ tempfile = "3"
 # plugin's export list keeps its symbols in (see CMakeLists.txt).
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64", "rand-std"] }
 
+# logos.signer/1: its payload types, signature checks and job bookkeeping.
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02" }
+
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
 # --no-default-features` can build the crypto core without it (and without the
 # generated scaffold / unresolved lp_* link symbols).
 logos-rust-sdk = { path = "../logos-rust-sdk-src", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+# mlock for unlocked keys, and keeping them out of core dumps on Linux.
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
+
+[dev-dependencies]
+logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02", features = ["conformance", "mock"] }
 
 [features]
 default = ["logos_module"]

@@ -208,7 +208,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 
 | Method | Params | Returns | Mutates accounts? |
 |--------|--------|---------|-------------------|
-| `configure` | `config_json: String` | `{ ok, approvers, custodians }` | no — sets who may |
+| `configure` | `config_json: String` | `{ ok, approvers, custodians, managers }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
@@ -243,13 +243,24 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
 | `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
+| `signer_info` | — | `{ ok, interface, kind, model, families, requestKinds, showsRequest, collects }` | no |
+| `signer_accounts` | — | `{ ok, accounts: [..] }` | no |
+| `sign` | `request_json: String` | `{ ok, job }` | no |
+| `sign_status` | `job: String` | `{ ok, job, state, code?, error? }` | no |
+| `sign_result` | `job: String` | `{ ok, job, signatures: [..] }` | no |
+| `cancel_sign` | `job: String` | `{ ok, job }` | no |
+| `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
+| `lock` | `params_json: String` | `{ ok, locked }` | no |
+| `unlocked` | — | `{ ok, unlocked: [..] }` | no |
+| `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
+| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal }` | yes → event |
 
 ---
 
 ### `configure(config_json: String) -> String`
 
-Name who holds the two roles. `config_json` is `{ approvers?, custodians? }`; the reply is
-`{ ok, approvers, custodians }` echoing what is now in force, or the usual
+Name who holds the three roles. `config_json` is `{ approvers?, custodians?, managers? }`; the
+reply is `{ ok, approvers, custodians, managers }` echoing what is now in force, or the usual
 `{ ok: false, error }`. It takes effect on the next call — nothing is reloaded.
 
 **A role is a set.** Each key takes one name or a list of them, because a terminal signer
@@ -272,7 +283,7 @@ the total rule a typo (`custodain`) would otherwise empty **both** roles: fail-c
 silent about why everything started refusing.
 
 **Until it is called, the built-in defaults stand** — `evm_signer_ui` approves, `evm_keystore_ui`
-mutates. A module nobody configures is not inert.
+mutates, `signer_manager_module` asks for signatures. A module nobody configures is not inert.
 
 #### It is deliberately ungated, for now
 
@@ -1133,14 +1144,103 @@ because rust-bitcoin's lookup for an `Xpriv` matches only a master key or the le
 **Residual.** rust-bitcoin's `Xpriv` is `Copy` and has no `Zeroize`, so derivation leaves
 copies of keys and chain codes the module cannot wipe; `AccountSecret` wipes its own on drop.
 
+## The keystore as a signer (`logos.signer/1`)
+
+The keystore implements [`logos.signer/1`](https://github.com/logos-co/logos-signer-interface),
+the contract every signer module implements, so the signer manager (`signer_manager_module`) can
+list its accounts and have it sign beside each hardware wallet's module. It signs **hashes only**:
+the manager reads, renders and commits to every request, computes each digest, and checks every
+signature against the account's public material before anything settles. The keystore parses no
+request on this path. The approval flow below keeps working until its last caller has moved to the
+manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conformance suite.
+
+### Who may call
+
+| Methods | Admits |
+|---|---|
+| `signer_info` | anyone: it describes the kind of signer, not an account |
+| `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `import_bitcoin` | a configured **custodian** (Tier D) |
+
+Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `unlock`: the
+manager keeps which apps an unlock covers and whether each signature is still confirmed, so a
+module that could reach `sign` past it would sign inside an unlock it was never granted.
+
+### `signer_info() -> String`
+
+`{ ok, interface: "logos.signer/1", kind: "keystore", model: "scrypt key files", families: ["evm",
+"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password" }`.
+
+### `signer_accounts() -> String`
+
+Every account as public material. An EVM account: `{ id: <address>, family: "evm", address, path?,
+label?, available: true }`, `path` only for a derived one. A Bitcoin wallet: `{ id: <group>, family:
+"bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'", fingerprint, xpub,
+label?, available: true }`.
+
+### `sign(request_json: String) -> String`
+
+`{ account, kind: "hash", items: [{ path?, scheme, digest }], secret? }` → `{ ok, job }`. Every item
+is checked against the account **before any vault opens**: an EVM account takes scheme `evm` and
+no path, and signs with its own key; a native segwit wallet takes `ecdsa` and a Bitcoin wallet's
+receive or change path (`m/84'/c'/a'/0|1/i`); a taproot wallet takes `bip86`. With `secret`, the
+vault opens with that password for this request only; without it, the account's unlock answers,
+and one request counts once against it however many items it carries. A wrong password is
+`wrong_secret`, one message for every way a vault fails to open, as `set_label` gives; no secret
+and no unlock is `locked`. Signatures are 64 bytes `r‖s` with low S, `recoveryId` for EVM, and
+the signing key (33 bytes, or 32 x-only for taproot) as `pubkey`.
+
+### `sign_status(job: String) -> String`, `sign_result(job: String) -> String`, `cancel_sign(job: String) -> String`
+
+A keystore job finishes inside `sign`, so `sign_status` answers `done` (or `failed` with its
+`code`) at once, and `sign_result` returns the signatures until the job is swept, ten minutes
+after it settled. `cancel_sign` is harmless on a settled job.
+
+### `unlock(params_json: String) -> String`, `lock(params_json: String) -> String`, `unlocked() -> String`
+
+`unlock` takes `{ account, password, ttlMs?, count? }` and holds the account's key in memory until
+`ttlMs` passes or `count` requests are signed — whichever comes first; neither means until it is
+locked. It answers `{ ok, account, expiresInMs, countLeft }`. `lock` takes `{ account? }` and locks
+that account, or every account for `{}`, answering `{ ok, locked: <how many> }`. `unlocked` lists
+`{ account, expiresInMs, countLeft }`.
+
+These are **not** the methods keystore#6 deleted. That `unlock` was callable by any module and
+its only caller passed `ttl: None`, so it never expired and nobody had chosen that. This one
+answers the manager alone, which takes the terms from a person in the keys app; the keystore
+enforces the time and the count, the manager the apps and the confirmation. A new password and a
+deleted account end the account's unlock, and nothing about an unlock is written to disk.
+
+### `database_key(params_json: String) -> String`
+
+`{ group, password? }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
+wallet core's database, for an open request the keys app approved. With `password` the vault
+opens; without it, the wallet's unlock answers, and opening uses no count.
+
+### `import_bitcoin(params_json: String) -> String`
+
+`{ phrase, passphrase?, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", account?,
+password, label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`, the
+two descriptors with their checksums. Tier D. See [Bitcoin wallets](#bitcoin-wallets-bip84-bip86).
+
+### Events
+
+`signer_accounts_changed` goes out with every `accounts_changed`, with the same count, from one helper, so the
+two cannot drift; `rust-lib/tests/every_displayed_mutation_announces_itself.rs` checks both.
+`signer_changed` and `sign_progress` are part of the interface; the keystore has no device and
+finishes its jobs inside `sign`, so it never sends them.
+
+---
+
 ## Human-approved signing
 
-There is **no way to make this module sign anything except by a human approving
-it.** The methods that used to sign on demand — `unlock`, `timed_unlock`, `lock`,
-`is_unlocked`, `sign_transaction`, `sign_message`, `sign_digest` — are **deleted
-from the contract**, not merely gated. There is no unlocked-signer cache: the
-signing key is derived from the vault password *inside* `approve()`, used, and
-zeroized before the call returns.
+There is **no way to make this module sign anything except by a person's approval**: of the
+request, or of an unlock whose terms cover it. The methods that used to sign on demand —
+`timed_unlock`, `is_unlocked`, `sign_transaction`, `sign_message`, `sign_digest`, and the
+`unlock` and `lock` keystore#6 removed — are **deleted from the contract**, not merely gated. On
+this path the signing key is derived from the vault password *inside* `approve()`, used, and
+zeroized before the call returns. The signer interface's `unlock` (above) answers the manager
+alone, on terms a person set.
 
 ### The three tiers
 
@@ -1152,7 +1252,8 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin` | a configured **custodian** (default `evm_keystore_ui`) |
+| **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
 names and `gate::tier_d_admits(method, custodian, caller)` is the only decision.
@@ -1836,7 +1937,16 @@ pub struct Keystore {
 }
 ```
 
-**There is no unlocked-signer cache, by construction.** A decrypted key exists only
+**Unlocked keys live in one place: `signer::Unlocks`.** An unlock the manager asked for holds the
+account's private key, or a Bitcoin wallet's account key and database key, in a buffer locked into
+RAM where the system allows it (`mlock`, `VirtualLock`), and on Linux the process stops writing core
+dumps once one exists. The buffer is wiped when the unlock ends: on its time or count, on `lock`,
+on a password change, or when the account is deleted. Each signature rebuilds the key from it for
+that one call. Nothing about an unlock is written to disk, and a restart locks everything. The
+signer interface's job table holds signatures, never keys, and forgets them ten minutes after a
+job settles.
+
+**Outside an unlock there is no signer cache, by construction.** A decrypted key exists only
 as a local inside `approve()`: derived from the vault password, used to sign every
 leg of the bundle, then zeroized (`Zeroizing` wraps the password, the derived key
 and the signer's key bytes) before the call returns. Nothing outside that call

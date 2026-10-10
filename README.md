@@ -12,13 +12,13 @@ Built on well-established crates: [`alloy`](https://github.com/alloy-rs/alloy)
 
 ## Contract (`KeystoreModule`)
 
-**Configuration:** `configure` names who holds the two roles —
-`{ approvers?, custodians? }` → `{ ok, approvers, custodians }`. Each role is a **set**, so
+**Configuration:** `configure` names who holds the three roles —
+`{ approvers?, custodians?, managers? }` → `{ ok, approvers, custodians, managers }`. Each role is a **set**, so
 a terminal signer can approve alongside `evm_signer_ui` rather than by displacing it; write one
 name or a list of them. It is **total**: a role the document does not name is held by
 nobody, and an empty set admits no caller. Until it is called the built-in defaults stand
-(`evm_signer_ui` approves, `evm_keystore_ui` mutates), so a deployment that configures nothing still
-works. A malformed document is refused whole and
+(`evm_signer_ui` approves, `evm_keystore_ui` mutates, `signer_manager_module` asks for signatures),
+so a deployment that configures nothing still works. A malformed document is refused whole and
 leaves the roles in force untouched.
 
 Configuration arrives by **method call**, never as a file in the module's persistence
@@ -117,9 +117,20 @@ checked by derivation, the fee it computed) and signs with rust-bitcoin. See
 **Signing** goes through the human-approval tiers — `request_approval` /
 `approval_status` / `fetch_result` / `ack_result` / `cancel_approval` for any named
 module, and `pending` / `acknowledge` / `approve` / `reject` for the configured
-approver. There is no `unlock`, no signer cache, and no method that signs on demand.
+approver. No method signs on demand.
 
-Events: `accounts_changed`, `approval_offered`, `approval_settled`. All structured
+**A signer** (phase K1 of the Shared Keystore Plan): the keystore implements
+[`logos.signer/1`](https://github.com/logos-co/logos-signer-interface), so the signer manager
+lists its accounts beside each hardware wallet's and has it sign. `signer_info` and
+`signer_accounts` describe it; `sign` / `sign_status` / `sign_result` / `cancel_sign` sign hashes
+the manager prepared, with the account's password or inside an unlock; `unlock` / `lock` hold an
+account's key in locked memory until a time or a count of requests runs out; `database_key`
+releases a Bitcoin wallet's database key for an approved open. Those answer the configured
+manager alone (Tier M). `import_bitcoin` makes a Bitcoin wallet from a phrase (Tier D). The
+approval flow above keeps working until its callers move to the manager.
+
+Events: `accounts_changed`, `approval_offered`, `approval_settled`, and the signer interface's
+`signer_accounts_changed`, sent with every `accounts_changed`. All structured
 values cross the IPC boundary as JSON strings. `accounts_changed` fires after every
 mutation that changes what a reader displays — a rename included — and its `count` is
 advisory, because a rename does not move it.

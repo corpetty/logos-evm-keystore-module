@@ -12,6 +12,8 @@ pub const DEFAULT_APPROVER: &str = "evm_signer_ui";
 /// which accounts exist; creating, importing, exporting and deleting them belongs to one
 /// surface, and that surface is the keystore UI.
 pub const DEFAULT_CUSTODIAN: &str = "evm_keystore_ui";
+/// Default manager: the signer manager, the only module that asks this keystore to sign.
+pub const DEFAULT_MANAGER: &str = "signer_manager_module";
 
 /// Who holds the two roles. Configuration, so it is data rather than a decision — but it
 /// lives here because it is the only input the decisions below take besides the caller.
@@ -23,6 +25,7 @@ pub const DEFAULT_CUSTODIAN: &str = "evm_keystore_ui";
 pub struct Roles {
     pub approvers: Vec<String>,
     pub custodians: Vec<String>,
+    pub managers: Vec<String>,
 }
 
 /// The built-in defaults, in force from load. A module nobody configures is not inert.
@@ -31,6 +34,7 @@ impl Default for Roles {
         Self {
             approvers: vec![DEFAULT_APPROVER.into()],
             custodians: vec![DEFAULT_CUSTODIAN.into()],
+            managers: vec![DEFAULT_MANAGER.into()],
         }
     }
 }
@@ -71,7 +75,7 @@ impl RoleWire {
     }
 }
 
-/// `{ approvers?, custodians? }`. Unknown keys are refused rather than ignored: under the
+/// `{ approvers?, custodians?, managers? }`. Unknown keys are refused rather than ignored: under the
 /// total rule below a typo'd key would otherwise empty BOTH roles, which fails closed but
 /// says nothing about why. That also catches the pre-list `approver`/`custodian` spelling,
 /// which is the right way for a stale configuration to fail.
@@ -82,10 +86,12 @@ struct RolesWire {
     approvers: RoleWire,
     #[serde(default)]
     custodians: RoleWire,
+    #[serde(default)]
+    managers: RoleWire,
 }
 
 impl Roles {
-    /// Replace both roles from a `{ approvers?, custodians? }` document.
+    /// Replace every role from a `{ approvers?, custodians?, managers? }` document.
     ///
     /// TOTAL, not a patch: the document is the whole answer to "who holds these roles", so
     /// one it does not name is held by nobody — an empty set admits nobody. Half a
@@ -102,6 +108,7 @@ impl Roles {
         let wire: RolesWire = serde_json::from_value(doc).map_err(|e| e.to_string())?;
         self.approvers = wire.approvers.into_holders();
         self.custodians = wire.custodians.into_holders();
+        self.managers = wire.managers.into_holders();
         Ok(())
     }
 }
@@ -189,11 +196,23 @@ pub const TIER_D_METHODS: &[&str] = &[
     // rather than to whoever reads it.
     "settle",
     "remove_unexplained",
+    // A Bitcoin wallet from a phrase: a mutation like any import.
+    "import_bitcoin",
 ];
 
 /// Tier D: a configured custodian, for a method the registry names.
 pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bool {
     TIER_D_METHODS.contains(&method) && holds_any_role(custodians, caller)
+}
+
+/// The signer interface's signing calls and the keys an unlock holds — Tier M, the manager's.
+/// The manager enforces which apps an unlock covers; a module reaching these past it would not.
+pub const TIER_M_METHODS: &[&str] =
+    &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key"];
+
+/// Tier M: a configured manager, for a method the registry names.
+pub fn tier_m_admits(method: &str, managers: &[String], caller: &Caller) -> bool {
+    TIER_M_METHODS.contains(&method) && holds_any_role(managers, caller)
 }
 
 #[cfg(test)]
@@ -419,6 +438,39 @@ mod tests {
         assert_eq!(r.approvers, holders(&["evm_signer_ui", "evm_signer_cli"]));
         assert!(r.custodians.is_empty());
         assert!(holds_any_role(&r.approvers, &m("evm_signer_ui")));
+    }
+
+    #[test]
+    fn tier_m_admits_only_the_manager_for_every_signing_call() {
+        let r = Roles::default();
+        for method in TIER_M_METHODS {
+            assert!(tier_m_admits(method, &r.managers, &m("signer_manager_module")), "{method}");
+            for other in [
+                m("evm_signer_ui"),
+                m("evm_keystore_ui"),
+                m("eth_wallet_backend"),
+                Caller::HostAnchor,
+                Caller::Unknown,
+                Caller::Operator("signer_manager_module".into()),
+                Caller::Derived { parent: "signer_manager_module".into(), leaf: "child".into() },
+            ] {
+                assert!(!tier_m_admits(method, &r.managers, &other), "{method} admitted {other:?}");
+            }
+            assert!(!tier_m_admits(method, &[], &m("signer_manager_module")), "{method}");
+        }
+        for unknown in ["approve", "import_bitcoin", "signer_accounts", ""] {
+            assert!(!tier_m_admits(unknown, &r.managers, &m("signer_manager_module")), "{unknown:?}");
+        }
+    }
+
+    #[test]
+    fn a_configuration_that_does_not_name_managers_leaves_signing_to_nobody() {
+        let mut r = Roles::default();
+        r.configure(r#"{"approvers":"evm_signer_ui","custodians":"evm_keystore_ui"}"#).unwrap();
+        assert!(r.managers.is_empty());
+        r.configure(r#"{"managers":["signer_manager_module","probe_manager"]}"#).unwrap();
+        assert!(tier_m_admits("sign", &r.managers, &m("probe_manager")));
+        assert!(r.approvers.is_empty() && r.custodians.is_empty(), "total: the other roles went");
     }
 
     #[test]

@@ -2165,6 +2165,16 @@ impl Keystore {
 
     /// The account key, refused unless it is the one the record's xpub describes: a swapped vault signs nothing.
     fn open_bitcoin_key(&self, id: &str, password: &str, acct: &AccountPublic) -> Result<AccountSecret> {
+        self.open_bitcoin_vault(id, password, acct).map(|(secret, _)| secret)
+    }
+
+    /// The account key and the database key, from a vault checked against the record.
+    pub(crate) fn open_bitcoin_vault(
+        &self,
+        id: &str,
+        password: &str,
+        acct: &AccountPublic,
+    ) -> Result<(AccountSecret, Zeroizing<String>)> {
         check_group_id(id)?;
         if !self.scan()?.keys.iter().any(|k| k == id) {
             return Err(KeystoreError::NotFound(format!("the key of wallet {id}")));
@@ -2177,7 +2187,12 @@ impl Keystore {
         if secret.xpub(&bitcoin::secp256k1::Secp256k1::new()) != acct.xpub {
             return Err(KeystoreError::Refused(format!("the vault of wallet {id} holds another wallet's key")));
         }
-        Ok(secret)
+        Ok((secret, Zeroizing::new(vault.database_key.clone())))
+    }
+
+    /// The ids of every Bitcoin wallet whose record names its family.
+    pub fn bitcoin_groups(&self) -> Result<Vec<String>> {
+        Ok(self.get_groups()?.into_iter().filter(|(_, g)| g.family.is_some()).map(|(id, _)| id).collect())
     }
 
     fn open_bitcoin_vault_at(&self, path: &Path, password: &str) -> Result<BitcoinVault> {

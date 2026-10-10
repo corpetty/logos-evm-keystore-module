@@ -10,7 +10,8 @@
 //! showing the old name until its view was closed and reopened.
 
 const GLUE: &str = include_str!("../src/glue.rs");
-const EMIT: &str = "emit_accounts_changed";
+/// One call sends both account events: the keystore's and the signer interface's.
+const EMIT: &str = "self.announce()";
 
 /// Mutations that move something a reader shows — the account set, or the names and wallets
 /// it is displayed under. `change_password` is deliberately absent: it re-encrypts a vault
@@ -29,6 +30,7 @@ const ANNOUNCES: &[&str] = &[
     "forget_derivation",
     "remove_unexplained",
     "settle",
+    "import_bitcoin",
 ];
 
 /// Methods that must stay silent: they persist nothing, or nothing a reader shows. Listed so
@@ -47,6 +49,17 @@ const SILENT: &[&str] = &[
     "list_groups",
     "list_derivation_keys",
     "caller_identity",
+    // The signer interface: signing and unlocking move no account a reader shows.
+    "signer_info",
+    "signer_accounts",
+    "sign",
+    "sign_status",
+    "sign_result",
+    "cancel_sign",
+    "unlock",
+    "lock",
+    "unlocked",
+    "database_key",
 ];
 
 /// The file with comments and string literals blanked, byte offsets preserved: brace and
@@ -204,7 +217,7 @@ fn set_label_body() -> String {
 
 #[test]
 fn a_deleted_announcement_is_rejected() {
-    let mutant = set_label_body().replace(&format!("{EMIT}(self.account_count());"), "");
+    let mutant = set_label_body().replace(&format!("{EMIT};"), "");
     assert_eq!(announcements(&mutant), (0, 0));
 }
 
@@ -212,8 +225,8 @@ fn a_deleted_announcement_is_rejected() {
 fn an_announcement_moved_to_the_refusal_path_is_rejected() {
     let real = set_label_body();
     let mutant = real
-        .replace(&format!("{EMIT}(self.account_count());"), "")
-        .replacen("Err(e) => err(e),", &format!("Err(e) => {{ {EMIT}(0); err(e) }},"), 1);
+        .replace(&format!("{EMIT};"), "")
+        .replacen("Err(e) => err(e),", &format!("Err(e) => {{ {EMIT}; err(e) }},"), 1);
     let (on_success, stray) = announcements(&mutant);
     assert_eq!(on_success, 0, "an Err arm is not a success path");
     assert_eq!(stray, 1);
@@ -222,8 +235,17 @@ fn an_announcement_moved_to_the_refusal_path_is_rejected() {
 #[test]
 fn an_unconditional_announcement_ahead_of_the_match_is_rejected() {
     let real = set_label_body();
-    let mutant = real.replacen("match self.ks()", &format!("{EMIT}(0); match self.ks()"), 1);
+    let mutant = real.replacen("match self.ks()", &format!("{EMIT}; match self.ks()"), 1);
     let (on_success, stray) = announcements(&mutant);
     assert_eq!(on_success, 1, "the real one still stands");
     assert_eq!(stray, 1, "and the unconditional one is counted as a stray");
+}
+
+/// The one place both events leave from: dropping either is a reader that never refreshes.
+#[test]
+fn announcing_sends_the_keystores_event_and_the_signer_interfaces() {
+    let code = code_only(GLUE);
+    let body = body_of(&code, "announce");
+    assert!(body.contains("emit_accounts_changed("), "the keystore's own event");
+    assert!(body.contains("emit_signer_accounts_changed("), "the signer interface's event");
 }
