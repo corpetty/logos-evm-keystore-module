@@ -252,8 +252,8 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `unlock` | `params_json: String` | `{ ok, account, expiresInMs, countLeft }` | no |
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
-| `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
-| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }` | yes → event |
+| `database_key` | `params_json: String` | `{ ok, group, databaseKey, origin, birthday }` | no |
+| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase, origin, birthday }` | yes → event |
 | `show_phrase` | `params_json: String` | `{ ok, phrase, words }` | no |
 | `forget_phrase` | `params_json: String` | `{ ok, forgotten }` | yes → event |
 | `list_phrases` | — | `{ ok, phrases: [{ id, groups, staged }] }` | no |
@@ -1085,9 +1085,9 @@ logosctl call keystore_module remove_unexplained '{"path":"backup.json","acknowl
 
 ## Bitcoin wallets (BIP84, BIP86)
 
-*Phase K0 of the Shared Keystore Plan: the core is here and is reached through `request_approval`
-and `approve`. Creating Bitcoin wallets over IPC, opening them for a wallet and unlocking them
-come in K1.*
+*Phase K0 of the Shared Keystore Plan built the core; K1 and K2 added creating Bitcoin wallets over
+IPC (`import_bitcoin`), opening them for a wallet core through the signer manager, and unlocking
+them.*
 
 A Bitcoin wallet is a derivation group of one **family**, on one **chain**:
 
@@ -1109,6 +1109,17 @@ generated with the group and derived from nothing, for the wallet core's encrypt
 The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
 EVM records are written exactly as before; those fields are absent from them.
+
+**Where its history starts.** The record also keeps `origin` and `birthday`, for the wallet core
+to know where to start scanning:
+- `created`: the keys app made the phrase for this wallet, so no coin can have reached it before
+  the day it is made. `birthday` is that day, by the keystore's clock, in UTC.
+- `restored`: the phrase came from elsewhere, or was kept earlier. `birthday` is the day the
+  person gave, if they knew it.
+
+A birthday is a real day as `YYYY-MM-DD`, from 2009-01-03 to tomorrow in UTC, since the person's
+day may run ahead of it. A wallet from a kept phrase is always `restored`, since the phrase is older
+than the wallet. A record from before these were kept reads `restored`, with no birthday.
 
 `account_descriptors` (`{ group }`, for the configured manager or custodian, so the keys app can
 show a wallet's descriptor with its warning) returns both descriptors with their BIP380
@@ -1227,16 +1238,21 @@ deleted account end the account's unlock, and nothing about an unlock is written
 
 ### `database_key(params_json: String) -> String`
 
-`{ group, password? }` → `{ ok, group, databaseKey }`: a Bitcoin wallet's 32 random bytes for the
-wallet core's database, for an open request the keys app approved. With `password` the vault
-opens; without it, the wallet's unlock answers, and opening uses no count.
+`{ group, password? }` → `{ ok, group, databaseKey, origin, birthday }`: a Bitcoin wallet's 32
+random bytes for the wallet core's database, for an open request the keys app approved, with where
+its history starts (`birthday` is `null` when unknown). With `password` the vault opens; without
+it, the wallet's unlock answers, and opening uses no count.
 
 ### `import_bitcoin(params_json: String) -> String`
 
 `{ phrase, passphrase?, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", account?,
-password, label?, keepPhrase?: { password } }` → `{ ok, group, family, chain, path, fingerprint,
-external, internal, phrase }`, the two descriptors with their checksums. Tier D. See [Bitcoin
-wallets](#bitcoin-wallets-bip84-bip86).
+password, label?, keepPhrase?: { password }, origin?: "created" | "restored", birthday? }` →
+`{ ok, group, family, chain, path, fingerprint, external, internal, phrase, origin, birthday }`,
+the two descriptors with their checksums. Tier D. See [Bitcoin wallets](#bitcoin-wallets-bip84-bip86).
+
+`origin` defaults to `restored`, which takes an optional `birthday`. `created` takes none: its
+birthday is the day it is made. A birthday that isn't a real day from 2009-01-03 on, or a created
+wallet from a kept phrase, is refused and records nothing.
 
 `keepPhrase` keeps the phrase in a vault of its own under that password, and `phrase` in the
 reply is its id. `{ keptPhrase, phrasePassword }` in place of `phrase` makes another wallet from

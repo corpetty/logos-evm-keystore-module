@@ -1313,6 +1313,7 @@ mod tests {
                 password: "pw",
                 label: "Savings",
                 keep: crate::keystore::KeepPhrase::No,
+                start: crate::keystore::WalletStart::Restored(None),
             })
             .unwrap();
         let psbt = crate::psbt::tests::sample(&g.account);
@@ -1387,6 +1388,7 @@ mod tests {
                 password: "pw",
                 label: "",
                 keep: crate::keystore::KeepPhrase::No,
+                start: crate::keystore::WalletStart::Restored(None),
             })
             .unwrap();
         let groups = dir.path().join("groups");

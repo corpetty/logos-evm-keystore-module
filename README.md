@@ -126,10 +126,12 @@ lists its accounts beside each hardware wallet's and has it sign. `signer_info` 
 `signer_accounts` describe it; `sign` / `sign_status` / `sign_result` / `cancel_sign` sign hashes
 the manager prepared, with the account's password or inside an unlock; `unlock` / `lock` hold an
 account's key in locked memory until a time or a count of requests runs out; `database_key`
-releases a Bitcoin wallet's database key for an approved open. Those answer the configured
+releases a Bitcoin wallet's database key for an approved open, with where its history starts. Those answer the configured
 manager alone (Tier M). `import_bitcoin` makes a Bitcoin wallet from a phrase (Tier D), and keeps
 the phrase in a vault of its own when the person asks (`keepPhrase`), as `import_mnemonic` now
-does for an EVM wallet; either makes a wallet from a phrase kept earlier (`keptPhrase`).
+does for an EVM wallet; either makes a wallet from a phrase kept earlier (`keptPhrase`). It records
+whether the keys app made the phrase for this wallet (`origin: created`) or the person brought it
+(`restored`, with the `birthday` they give), so a wallet core knows where to start scanning.
 `show_phrase` and `forget_phrase` (Tier D) and `list_phrases` (ungated, ids only) cover kept
 phrases. The
 approval flow above keeps working until its callers move to the manager.

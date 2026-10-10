@@ -21,7 +21,7 @@ use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
-use crate::BitcoinImport;
+use crate::{BitcoinImport, WalletStart};
 use logos_signer_interface::jobs::JobTable;
 use logos_signer_interface::{json as signer_json, wire};
 
@@ -200,12 +200,14 @@ pub trait KeystoreModule: Send + 'static {
     fn lock(&mut self, params_json: String) -> String;
     /// `{ ok, unlocked: [{ account, expiresInMs, countLeft }] }`. The manager and the custodian.
     fn unlocked(&mut self) -> String;
-    /// A Bitcoin wallet's database key for an open request the keys app approved:
-    /// `{ group, password? }` → `{ ok, group, databaseKey }`, from its unlock when no password. Tier M.
+    /// A Bitcoin wallet's database key for an open request the keys app approved: `{ group,
+    /// password? }` → `{ ok, group, databaseKey, origin, birthday }`, from its unlock when no
+    /// password. Tier M.
     fn database_key(&mut self, params_json: String) -> String;
     /// A Bitcoin wallet from a phrase: `{ phrase, passphrase?, family, chain, account?, password,
-    /// label?, keepPhrase?: { password } }`, or `{ keptPhrase, phrasePassword, … }` in place of
-    /// `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }`. Tier D.
+    /// label?, keepPhrase?: { password }, origin?, birthday? }`, or `{ keptPhrase, phrasePassword, … }`
+    /// in place of `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal,
+    /// phrase, origin, birthday }`. Tier D.
     fn import_bitcoin(&mut self, params_json: String) -> String;
     /// A kept phrase's words, for the keys app to show: `{ phrase, password }` → `{ ok, phrase,
     /// words }`. Tier D.
@@ -512,6 +514,12 @@ struct ImportBitcoinParams {
     kept_phrase: Option<String>,
     #[serde(default, rename = "phrasePassword")]
     phrase_password: String,
+    /// `created` when the keys app made the phrase for this wallet; `restored`, the default, otherwise.
+    #[serde(default)]
+    origin: Option<String>,
+    /// A restored wallet's first day of use, `YYYY-MM-DD`, if the person knows it.
+    #[serde(default)]
+    birthday: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1327,11 +1335,18 @@ impl KeystoreModule for KeystoreModuleImpl {
             Err(e) => return e,
         };
         let password = p.password.map(Zeroizing::new);
-        match self.signer() {
+        let key = match self.signer() {
             Ok(mut s) => match s.database_key(&p.group, password.as_ref().map(|pw| pw.as_str())) {
-                Ok(key) => json!({ "ok": true, "group": p.group, "databaseKey": key.as_str() }).to_string(),
-                Err(e) => wire::err(&e),
+                Ok(key) => key,
+                Err(e) => return wire::err(&e),
             },
+            Err(e) => return err(e),
+        };
+        // Where the wallet core starts scanning travels with the key that opens its database.
+        match self.ks().and_then(|ks| ks.bitcoin_start(&p.group).map_err(|e| e.to_string())) {
+            Ok((origin, birthday)) => json!({ "ok": true, "group": p.group, "databaseKey": key.as_str(),
+                                              "origin": origin, "birthday": birthday })
+            .to_string(),
             Err(e) => err(e),
         }
     }
@@ -1353,6 +1368,13 @@ impl KeystoreModule for KeystoreModuleImpl {
             (Ok(f), Ok(c)) => (f, c),
             (Err(e), _) | (_, Err(e)) => return err(e),
         };
+        let birthday = p.birthday.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        let start = match (p.origin.as_deref().map(str::trim), birthday) {
+            (Some("created"), None) => WalletStart::Created,
+            (Some("created"), Some(_)) => return err("a created wallet's birthday is the day it is made; send none"),
+            (None | Some("restored"), day) => WalletStart::Restored(day),
+            (Some(other), _) => return err(format!("origin must be created or restored, not {other:?}")),
+        };
         let ks = match self.ks() {
             Ok(ks) => ks,
             Err(e) => return err(e),
@@ -1371,16 +1393,21 @@ impl KeystoreModule for KeystoreModuleImpl {
             password: &password,
             label: &p.label,
             keep,
+            start,
         };
         match ks.import_bitcoin(&req) {
             Ok(g) => {
-                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&g.id).and_then(|r| r.phrase.clone()));
+                let record = ks.get_groups().ok().and_then(|mut gs| gs.remove(&g.id));
+                let kept = record.as_ref().and_then(|r| r.phrase.clone());
+                let birthday = record.and_then(|r| r.birthday);
                 self.announce();
                 json!({ "ok": true, "group": g.id, "family": family.as_str(), "chain": chain.as_str(),
                         "path": format!("m/{}", g.account.origin().to_string().trim_start_matches("m/")),
                         "fingerprint": g.account.fingerprint.to_string(),
                         "external": g.account.descriptor(0), "internal": g.account.descriptor(1),
-                        "phrase": kept })
+                        "phrase": kept,
+                        "origin": if start == WalletStart::Created { "created" } else { "restored" },
+                        "birthday": birthday })
                 .to_string()
             }
             Err(e) => err(e),

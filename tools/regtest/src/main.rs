@@ -139,6 +139,7 @@ fn run(node: &Node, family: Family) -> Res<()> {
         password: "pw",
         label: "Regtest",
         keep: keystore_module::KeepPhrase::No,
+        start: keystore_module::WalletStart::Restored(None),
     })?;
     let (external, internal) = ks.account_descriptors(&g.id)?;
     println!("descriptor: {external}");
