@@ -107,6 +107,13 @@ renamed out of it, because
 would truncate a live vault. The staging guard drops on every exit this process can
 take; the scan covers the one it cannot.
 
+**Bitcoin** (phase K0 of the Shared Keystore Plan): a derivation group can also be a Bitcoin
+wallet, BIP84 native segwit or BIP86 taproot, whose vault keeps its account key and a random
+database key. A `psbt` leg names the wallet's `group`; the keystore reads the PSBT itself,
+refuses an input it would not sign, writes the lines the signer shows (each payment, change it
+checked by derivation, the fee it computed) and signs with rust-bitcoin. See
+[`docs/specs.md`](docs/specs.md#bitcoin-wallets-bip84-bip86) and `tools/regtest`.
+
 **Signing** goes through the human-approval tiers — `request_approval` /
 `approval_status` / `fetch_result` / `ack_result` / `cancel_approval` for any named
 module, and `pending` / `acknowledge` / `approve` / `reject` for the configured

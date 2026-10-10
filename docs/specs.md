@@ -1061,6 +1061,78 @@ logosctl call keystore_module remove_unexplained '{"path":"backup.json","acknowl
 
 ---
 
+## Bitcoin wallets (BIP84, BIP86)
+
+*Phase K0 of the Shared Keystore Plan: the core is here and is reached through `request_approval`
+and `approve`. Creating Bitcoin wallets over IPC, opening them for a wallet and unlocking them
+come in K1.*
+
+A Bitcoin wallet is a derivation group of one **family**, on one **chain**:
+
+| Family | Path | Script | Descriptor |
+|---|---|---|---|
+| `bitcoin` | `m/84'/c'/a'` (BIP84) | P2WPKH, native segwit | `wpkh([fp/84'/c'/a']xpub/0/*)` and `/1/*` |
+| `bitcoin_taproot` | `m/86'/c'/a'` (BIP86) | P2TR, key path only | `tr([fp/86'/c'/a']xpub/0/*)` and `/1/*` |
+
+`c` is 0 on the `main` chain and 1 on `test`, which covers testnet, testnet4, signet and
+regtest. Like the EVM path, neither is editable: `btc::parse_account_path` refuses any other
+purpose, coin type or depth, so a hand-edited record cannot redirect derivation. A request names
+its network, and a test wallet never signs for mainnet or the other way round.
+
+**What is kept.** The group's vault, at `groups/<id>.json` like an EVM group's derivation key,
+holds a JSON document inside the same scrypt envelope:
+`{ v: 1, family, accountKey, databaseKey }`. `accountKey` is the account-level xprv or tprv,
+the deepest key the wallet keeps; the root is never stored. `databaseKey` is 32 random bytes,
+generated with the group and derived from nothing, for the wallet core's encrypted database.
+The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
+but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
+EVM records are written exactly as before; those fields are absent from them.
+
+`account_descriptors(group)` (a library call in K0) returns both descriptors with their BIP380
+checksums. A Bitcoin wallet never exports a child key, which is what keeps showing its xpub
+safe; EVM groups still expose no xpub. EVM derivation refuses a Bitcoin group by name, and
+`forget_derivation` refuses one, because its vault holds the wallet's only key.
+
+**What the keystore checks before showing a PSBT.** Every input must be this wallet's: an
+entry in `bip32_derivation` (or `tap_key_origins` with the internal key) carrying this
+wallet's master fingerprint and a path under its account, whose derived key is the one named
+and whose script is the one spent. Refused, whole:
+
+* an input of another wallet, or one naming this wallet's keys twice;
+* a native segwit input without its previous transaction, a previous transaction that is not
+  the one spent, or an amount that disagrees with it. A segwit v0 signature commits only to
+  its own input's amount, which is the 2020 fee attack; a taproot signature commits to every
+  input's, so a false amount there signs nothing that can spend;
+* a sighash other than ALL, or DEFAULT for taproot;
+* a script path, a redeem or witness script, or an input already signed;
+* outputs worth more than the inputs.
+
+An output counts as this wallet's only if deriving the path it claims gives its script;
+anything else is shown as a send. The fee is the keystore's own sum, inputs minus outputs,
+and the rate beside it assumes the largest signatures, so it is never above the real one.
+
+```
+Wallet: "Savings"
+Commitment: 3b0c…
+1 item(s) to sign:
+  [1] Bitcoin signet · wallet "Savings", native segwit, account 0
+      Send 0.01500000 BTC to tb1q…
+      Change 0.00481234 BTC back to this wallet (m/84'/1'/0'/1/7, checked)
+      Fee 2,190 sats, about 14.1 sat/vB, computed from the inputs
+      Spends 2 coins worth 0.01983424 BTC · replaceable (RBF)
+```
+
+**Commitment and signing.** The commitment is SHA-256 over the consensus encoding of the
+unsigned transaction and, per input, the amount, script, path and sighash shown, and per
+output whether it is this wallet's and at which path. `approve` reads the PSBT again, checks
+the commitment, opens the vault with the password, refuses a vault whose key is not the one
+the record's xpub describes, and signs with rust-bitcoin's `Psbt::sign`: ECDSA for native
+segwit, BIP340 Schnorr with auxiliary randomness for taproot. The key lookup is our own,
+because rust-bitcoin's lookup for an `Xpriv` matches only a master key or the level below.
+
+**Residual.** rust-bitcoin's `Xpriv` is `Copy` and has no `Zeroize`, so derivation leaves
+copies of keys and chain codes the module cannot wipe; `AccountSecret` wipes its own on drop.
+
 ## Human-approved signing
 
 There is **no way to make this module sign anything except by a human approving
@@ -1364,6 +1436,16 @@ The intent is `{ address, purpose, legs: [...] }`, where each leg is one of:
 { "kind": "typed_data", "typed_data": { "types": …, "primaryType": "…", "domain": …, "message": … } }
 ```
 
+A Bitcoin request names a `group` instead of an `address` and carries exactly one leg:
+
+```jsonc
+{ "group": "g_…", "purpose": "…", "legs": [ { "kind": "psbt", "network": "regtest", "psbt": "cHNidP8B…" } ] }
+```
+
+The keystore reads the PSBT against that wallet before anything is shown, and refuses it whole
+on any input it would not sign; see [Bitcoin wallets](#bitcoin-wallets-bip84-bip86). An intent
+names exactly one of `address` and `group`, and a `psbt` leg never rides with an EVM leg.
+
 A `typed_data` leg is EIP-712, in the standard's own JSON. It is **not** opaque: the
 module parses it with alloy's implementation of the standard, computes the signing
 hash itself — never trusting one from the requester — and renders the domain, the
@@ -1394,7 +1476,8 @@ Limits: at most 4 pending per requester, 16 total, 64 KiB of intent.
 ### `fetch_result(handle: String, receipt: String) -> String`
 
 **Tier B.** Collect the signatures: `{ ok, signed: [ … ] }`, one entry per leg in
-request order. Idempotent until `ack_result`.
+request order. Idempotent until `ack_result`. For a `psbt` leg the entry is the PSBT, base64,
+with this wallet's signatures added and its unsigned transaction untouched.
 
 ### `ack_result(handle: String, receipt: String) -> bool`
 
@@ -1923,6 +2006,31 @@ The CI workflow resolves the commit under test and passes
 `--release-for logos-evm-keystore-module=<sha>` so the spec's `{release}`
 placeholder builds the PR's own code, then publishes a two-column HTML report to
 GitHub Pages.
+
+### Exported symbols
+
+On macOS and Linux the plugin exports only `qt_plugin_instance` and
+`qt_plugin_query_metadata_v2`, as it does on Windows (`exports/`, applied in `CMakeLists.txt`).
+Without the list it exported about 7,000 symbols, the Rust core's and the statically linked
+SDK's among them, and rust-bitcoin added libsecp256k1's 69 C functions.
+
+```bash
+nix build .#lib && nm -gU result/lib/keystore_module_plugin.dylib   # 2 symbols
+```
+
+### Regtest proof (Bitcoin)
+
+`tools/regtest` is its own crate and lock, so BDK never enters the module's build. It starts a
+regtest `bitcoind`, builds a BDK wallet from the keystore's descriptors, funds it, has BDK build
+a send, and runs it through `request_approval`, `acknowledge`, `approve` and `fetch_result`. It
+checks the fee line against BDK's fee, that a forged change output is shown as a send, that a
+false input amount is refused (native segwit) or produces a signature `bitcoind` rejects
+(taproot), and that `bitcoind` accepts and mines the honest send, for both families.
+
+```bash
+cd tools/regtest
+BITCOIND_EXE=$(nix build nixpkgs#bitcoind --no-link --print-out-paths)/bin/bitcoind cargo run --release
+```
 
 ### Unit tests (crypto core)
 
