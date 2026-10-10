@@ -1312,7 +1312,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             logos_rust_sdk::LogosCaller::Operator { name } => ("operator", name.clone()),
         };
         json!({ "ok": true, "kind": kind, "identity": name,
-                "approvers": self.roles.approvers, "custodians": self.roles.custodians })
+                "approvers": self.roles.approvers, "custodians": self.roles.custodians, "managers": self.roles.managers })
         .to_string()
     }
 }

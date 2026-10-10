@@ -242,7 +242,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `acknowledge` | `handle: String` | `{ ok, bundle_id, requester, claim_lines, render_lines }` | no |
 | `approve` | `handle, bundle_id, password: String` | `{ ok, signed_count: n }` | no |
 | `reject` | `handle: String` | `bool` | no |
-| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians }` | no |
+| `caller_identity` | — | `{ ok, kind, identity, approvers, custodians, managers }` | no |
 | `signer_info` | — | `{ ok, interface, kind, model, families, requestKinds, showsRequest, collects }` | no |
 | `signer_accounts` | — | `{ ok, accounts: [..] }` | no |
 | `sign` | `request_json: String` | `{ ok, job }` | no |
@@ -1651,11 +1651,12 @@ mistaken for a signable Ethereum digest.
 
 ### `caller_identity() -> String`
 
-Ungated observability: `{ ok, kind, identity, approvers, custodians }` where `kind` is one
-of `unknown` | `host` | `module` | `derived` | `operator`.
+Ungated observability: `{ ok, kind, identity, approvers, custodians, managers }` where `kind`
+is one of `unknown` | `host` | `module` | `derived` | `operator`.
 
-`approvers` and `custodians` are the names currently in force — the built-in defaults, or
-whatever `configure` last set. An **empty** list means that role is held by nobody and every
+`approvers`, `custodians` and `managers` are the names currently in force — the built-in
+defaults, or whatever `configure` last set. They are everything a total `configure` has to
+repeat: a document built from the first two alone would leave the manager unable to sign. An **empty** list means that role is held by nobody and every
 method of its tier refuses, which is what this field exists to make visible. (It used to
 carry a `configError` naming an unreadable `keystore.json`; there is no config file any
 more, so that state cannot occur and the field is gone.)

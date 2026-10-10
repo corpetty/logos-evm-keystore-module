@@ -48,7 +48,8 @@ scan being complete — which is not decidable by inspection.
 
 **Reads (ungated):** `list_accounts`, `has_address`, `get_labels`, `get_group_labels`,
 `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`,
-`caller_identity` — the last of which also reports the two role names in force.
+`caller_identity` — the last of which also reports the role names in force: approvers,
+custodians and managers.
 
 `get_account_wallets` is the canonical join of provenance and wallet names for account
 pickers: `{ ok, wallets: { "<address>": { wallet, index? } } }`. Accounts without a
