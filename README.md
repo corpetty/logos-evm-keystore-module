@@ -127,7 +127,9 @@ lists its accounts beside each hardware wallet's and has it sign. `signer_info` 
 the manager prepared, with the account's password or inside an unlock; `unlock` / `lock` hold an
 account's key in locked memory until a time or a count of requests runs out; `database_key`
 releases a Bitcoin wallet's database key for an approved open. Those answer the configured
-manager alone (Tier M). `import_bitcoin` makes a Bitcoin wallet from a phrase (Tier D). The
+manager alone (Tier M). `import_bitcoin` makes a Bitcoin wallet from a phrase (Tier D), and keeps
+the phrase in a vault of its own when the person asks (`keepPhrase`); `show_phrase` and
+`forget_phrase` (Tier D) and `list_phrases` (ungated, ids only) cover kept phrases. The
 approval flow above keeps working until its callers move to the manager.
 
 Events: `accounts_changed`, `approval_offered`, `approval_settled`, and the signer interface's

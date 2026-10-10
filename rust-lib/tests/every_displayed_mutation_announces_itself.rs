@@ -31,6 +31,7 @@ const ANNOUNCES: &[&str] = &[
     "remove_unexplained",
     "settle",
     "import_bitcoin",
+    "forget_phrase",
 ];
 
 /// Methods that must stay silent: they persist nothing, or nothing a reader shows. Listed so
@@ -49,6 +50,9 @@ const SILENT: &[&str] = &[
     "list_groups",
     "list_derivation_keys",
     "caller_identity",
+    // Showing a kept phrase moves nothing; the list of them is a read.
+    "show_phrase",
+    "list_phrases",
     // The signer interface: signing and unlocking move no account a reader shows.
     "signer_info",
     "signer_accounts",

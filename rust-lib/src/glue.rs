@@ -19,7 +19,7 @@ use crate::ack::Unrecoverable;
 use crate::approval::Approvals;
 use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
-use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, Keystore, Storage};
+use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::JobTable;
@@ -204,8 +204,16 @@ pub trait KeystoreModule: Send + 'static {
     /// `{ group, password? }` → `{ ok, group, databaseKey }`, from its unlock when no password. Tier M.
     fn database_key(&mut self, params_json: String) -> String;
     /// A Bitcoin wallet from a phrase: `{ phrase, passphrase?, family, chain, account?, password,
-    /// label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`. Tier D.
+    /// label?, keepPhrase?: { password } }`, or `{ keptPhrase, phrasePassword, … }` in place of
+    /// `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }`. Tier D.
     fn import_bitcoin(&mut self, params_json: String) -> String;
+    /// A kept phrase's words, for the keys app to show: `{ phrase, password }` → `{ ok, phrase,
+    /// words }`. Tier D.
+    fn show_phrase(&mut self, params_json: String) -> String;
+    /// Remove a kept phrase, no password needed: `{ phrase }` → `{ ok, forgotten }`. Tier D.
+    fn forget_phrase(&mut self, params_json: String) -> String;
+    /// Every kept phrase: `{ ok, phrases: [{ id, groups, staged }] }`. Ungated: ids only.
+    fn list_phrases(&mut self) -> String;
 
     /// Observability: what this module currently sees as its caller. Ungated
     /// and side-effect-free — identity cannot report its own absence.
@@ -455,6 +463,7 @@ struct DatabaseKeyParams {
 
 #[derive(Deserialize)]
 struct ImportBitcoinParams {
+    #[serde(default)]
     phrase: String,
     #[serde(default)]
     passphrase: String,
@@ -465,6 +474,26 @@ struct ImportBitcoinParams {
     password: String,
     #[serde(default)]
     label: String,
+    /// Keep the phrase in a vault of its own, under this password.
+    #[serde(default, rename = "keepPhrase")]
+    keep_phrase: Option<PasswordParams>,
+    /// Make the wallet from a kept phrase rather than typed words.
+    #[serde(default, rename = "keptPhrase")]
+    kept_phrase: Option<String>,
+    #[serde(default, rename = "phrasePassword")]
+    phrase_password: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordParams {
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct PhraseParams {
+    phrase: String,
+    #[serde(default)]
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -730,6 +759,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "accountCount": g.account_count, "derivable": g.derivable,
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
+                            "phrase": g.group.phrase,
                         })
                     })
                     .collect();
@@ -1270,11 +1300,27 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let (phrase, passphrase, password) =
+        let (typed, passphrase, password) =
             (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (keep_password, phrase_password) =
+            (Zeroizing::new(p.keep_phrase.map(|k| k.password)), Zeroizing::new(p.phrase_password));
         let (family, chain) = match (BtcFamily::parse(&p.family), BtcChain::parse(&p.chain)) {
             (Ok(f), Ok(c)) => (f, c),
             (Err(e), _) | (_, Err(e)) => return err(e),
+        };
+        let ks = match self.ks() {
+            Ok(ks) => ks,
+            Err(e) => return err(e),
+        };
+        // The words typed now, or the words of a phrase kept earlier, opened with its own password.
+        let (phrase, keep) = match (&p.kept_phrase, typed.trim().is_empty(), keep_password.as_deref()) {
+            (Some(id), true, None) => match ks.show_phrase(id, &phrase_password) {
+                Ok(words) => (words, KeepPhrase::Kept(id)),
+                Err(e) => return err(e),
+            },
+            (None, false, keep) => (typed, keep.map_or(KeepPhrase::No, KeepPhrase::New)),
+            (Some(_), _, _) => return err("keptPhrase replaces phrase, and is kept already"),
+            (None, true, _) => return err("name the phrase, or a kept one"),
         };
         let req = BitcoinImport {
             phrase: &phrase,
@@ -1284,19 +1330,65 @@ impl KeystoreModule for KeystoreModuleImpl {
             account: p.account,
             password: &password,
             label: &p.label,
+            keep,
         };
-        let res = match self.ks() {
-            Ok(ks) => ks.import_bitcoin(&req),
-            Err(e) => return err(e),
-        };
-        match res {
+        match ks.import_bitcoin(&req) {
             Ok(g) => {
+                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&g.id).and_then(|r| r.phrase.clone()));
                 self.announce();
                 json!({ "ok": true, "group": g.id, "family": family.as_str(), "chain": chain.as_str(),
                         "path": format!("m/{}", g.account.origin().to_string().trim_start_matches("m/")),
                         "fingerprint": g.account.fingerprint.to_string(),
-                        "external": g.account.descriptor(0), "internal": g.account.descriptor(1) })
+                        "external": g.account.descriptor(0), "internal": g.account.descriptor(1),
+                        "phrase": kept })
                 .to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn show_phrase(&mut self, params_json: String) -> String {
+        if !self.may_mutate("show_phrase") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: PhraseParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        match self.ks().and_then(|ks| ks.show_phrase(&p.phrase, &password).map_err(|e| e.to_string())) {
+            Ok(words) => {
+                let reply = Zeroizing::new(json!({ "ok": true, "phrase": p.phrase, "words": words.as_str() }).to_string());
+                reply.to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn forget_phrase(&mut self, params_json: String) -> String {
+        if !self.may_mutate("forget_phrase") {
+            return not_authorized();
+        }
+        let p: PhraseParams = match serde_json::from_str(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        match self.ks().and_then(|ks| ks.forget_phrase(&p.phrase).map_err(|e| e.to_string())) {
+            Ok(forgotten) => {
+                self.announce();
+                json!({ "ok": true, "forgotten": forgotten }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn list_phrases(&mut self) -> String {
+        match self.ks().and_then(|ks| ks.kept_phrases().map_err(|e| e.to_string())) {
+            Ok(kept) => {
+                let phrases: Vec<_> =
+                    kept.into_iter().map(|k| json!({ "id": k.id, "groups": k.groups, "staged": k.staged })).collect();
+                json!({ "ok": true, "phrases": phrases }).to_string()
             }
             Err(e) => err(e),
         }

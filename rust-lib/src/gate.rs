@@ -198,6 +198,10 @@ pub const TIER_D_METHODS: &[&str] = &[
     "remove_unexplained",
     // A Bitcoin wallet from a phrase: a mutation like any import.
     "import_bitcoin",
+    // A kept phrase: showing its words is for the keys app alone, and forgetting it removes
+    // key material, as `forget_derivation` does.
+    "show_phrase",
+    "forget_phrase",
 ];
 
 /// Tier D: a configured custodian, for a method the registry names.

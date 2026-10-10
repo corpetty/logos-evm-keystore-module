@@ -61,6 +61,12 @@ pub trait KeystoreCustodianModule: Send + 'static {
     fn keys(&mut self) -> String;
     /// What the keystore thinks of this caller — `{ kind, identity, approver, custodian }`.
     fn identity(&mut self) -> String;
+    /// `import_bitcoin`, with its document as given.
+    fn bitcoin(&mut self, params_json: String) -> String;
+    /// A kept phrase's words: `{ phrase, password }`.
+    fn phrase(&mut self, params_json: String) -> String;
+    /// `{ phrase }`: forget a kept phrase.
+    fn forget_phrase(&mut self, params_json: String) -> String;
 
     fn on_context_ready(&mut self, _ctx: &RustModuleContext) {}
 }
@@ -167,6 +173,18 @@ impl KeystoreCustodianModule for KeystoreCustodianModuleImpl {
 
     fn identity(&mut self) -> String {
         pass(modules().keystore_module.caller_identity())
+    }
+
+    fn bitcoin(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.import_bitcoin(&params_json))
+    }
+
+    fn phrase(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.show_phrase(&params_json))
+    }
+
+    fn forget_phrase(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.forget_phrase(&params_json))
     }
 }
 
