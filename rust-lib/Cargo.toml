@@ -45,6 +45,9 @@ sha2 = "0.10"
 # Atomic writes. Promoted from dev-dependencies: it was already in the lock graph, so this
 # adds zero nodes, and its NamedTempFile creates at 0600 rather than at the umask.
 tempfile = "3"
+# Bitcoin keys, PSBTs and BIP340 signing. Brings libsecp256k1 (C) beside alloy's k256; the
+# plugin's export list keeps its symbols in (see CMakeLists.txt).
+bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64", "rand-std"] }
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test

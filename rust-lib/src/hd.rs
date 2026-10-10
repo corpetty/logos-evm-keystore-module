@@ -223,6 +223,11 @@ impl Seed {
         signer_in_account(&self.account_key(path.account)?, path.change, path.index)
     }
 
+    /// The seed bytes, for a Bitcoin master key built by rust-bitcoin rather than coins-bip32.
+    pub(crate) fn as_secret(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+
     #[cfg(test)]
     pub(crate) fn bytes(&self) -> &[u8; 64] {
         &self.0

@@ -910,7 +910,8 @@ impl KeystoreModule for KeystoreModuleImpl {
         if self.roles.approvers.is_empty() {
             return not_authorized();
         }
-        match self.approvals.request(&requester, &intent_json) {
+        // The keystore is lent so a Bitcoin request can be read against its wallet.
+        match self.approvals.request_with(self.ks.as_ref(), &requester, &intent_json) {
             Ok((handle, receipt)) => {
                 emit_approval_offered(&handle);
                 json!({ "ok": true, "handle": handle, "receipt": receipt }).to_string()

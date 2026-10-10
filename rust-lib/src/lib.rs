@@ -37,3 +37,7 @@ mod glue;
 
 pub mod gate;
 pub mod approval;
+
+/// Bitcoin accounts (BIP84, BIP86) and the PSBTs they sign. Pure, like `hd`.
+pub mod btc;
+pub mod psbt;

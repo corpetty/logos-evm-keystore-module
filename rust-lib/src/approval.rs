@@ -25,11 +25,13 @@ use sha2::{Digest as _, Sha256};
 use zeroize::Zeroizing;
 
 use alloy::primitives::U256;
+use bitcoin::secp256k1::Secp256k1;
 
 use crate::keystore::{
     check_displayable, parse_u128, sign_digest_with, sign_message_with, sign_parsed_tx, Keystore,
     KeystoreError, UnsignedTx,
 };
+use crate::psbt as btcpsbt;
 
 type Result<T> = std::result::Result<T, KeystoreError>;
 
@@ -85,14 +87,20 @@ pub enum Leg {
     /// Unlike a digest it is NOT opaque: the domain and every field of the message are
     /// shown, and the signing hash is computed here, never trusted from the requester.
     TypedData { typed_data: serde_json::Value },
+    /// A Bitcoin PSBT, base64, for the intent's `group`. Read and described by the keystore itself.
+    Psbt { network: String, psbt: String },
 }
 
 /// What a requester submits.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Intent {
-    /// The account to sign with.
+    /// The EVM account to sign with. An intent names this or `group`, never both.
+    #[serde(default)]
     pub address: String,
+    /// The Bitcoin wallet to sign with.
+    #[serde(default)]
+    pub group: String,
     /// A short requester-supplied label for the whole bundle, shown as a claim.
     #[serde(default)]
     pub purpose: String,
@@ -232,6 +240,16 @@ impl Approvals {
     /// binds `fetch_result` to the requester, because the handle itself is
     /// broadcast on an unauthenticated event plane.
     pub fn request(&mut self, requester: &str, intent_json: &str) -> Result<(String, String)> {
+        self.request_with(None, requester, intent_json)
+    }
+
+    /// `request`, with the keystore a Bitcoin request is read against.
+    pub fn request_with(
+        &mut self,
+        ks: Option<&Keystore>,
+        requester: &str,
+        intent_json: &str,
+    ) -> Result<(String, String)> {
         self.sweep();
 
         if intent_json.len() > MAX_INTENT_BYTES {
@@ -264,8 +282,9 @@ impl Approvals {
         }
         check_displayable(&intent.purpose, "purpose")?;
 
-        let bundle_id = commitment(&intent)?;
-        let (claim_lines, render_lines) = render(&intent, &bundle_id)?;
+        let prepared = prepare(ks, &intent)?;
+        let bundle_id = commitment(&intent, &prepared)?;
+        let (claim_lines, render_lines) = render(&intent, &prepared, &bundle_id)?;
 
         self.seq += 1;
         let handle = format!("ksh_{}", token_hex(self.seq));
@@ -366,7 +385,8 @@ impl Approvals {
 
         // Re-derive rather than trust the stored value, and check the approver
         // echoed the same thing it displayed.
-        let fresh = commitment(&r.intent)?;
+        let prepared = prepare(Some(ks), &r.intent)?;
+        let fresh = commitment(&r.intent, &prepared)?;
         if fresh != r.bundle_id {
             return Err(KeystoreError::InvalidParams("approve: commitment drift".into()));
         }
@@ -376,20 +396,27 @@ impl Approvals {
             ));
         }
 
-        // ONE derivation for the whole bundle.
-        let signer = ks.signer_for(&r.intent.address, password)?;
-        let mut out = Vec::with_capacity(r.intent.legs.len());
-        for leg in &r.intent.legs {
-            out.push(match leg {
-                Leg::Tx { chain_id, tx } => sign_parsed_tx(&signer, tx, *chain_id)?,
-                Leg::Message { text } => sign_message_with(&signer, text)?,
-                Leg::Digest { digest, .. } => sign_digest_with(&signer, digest)?,
-                Leg::TypedData { typed_data } => {
-                    sign_digest_with(&signer, &typed_data_signing_hash(typed_data)?)?
+        let out = match prepared {
+            Prepared::Psbt { .. } => vec![sign_psbt_leg(ks, &r.intent, password)?],
+            Prepared::Evm => {
+                // ONE derivation for the whole bundle.
+                let signer = ks.signer_for(&r.intent.address, password)?;
+                let mut out = Vec::with_capacity(r.intent.legs.len());
+                for leg in &r.intent.legs {
+                    out.push(match leg {
+                        Leg::Tx { chain_id, tx } => sign_parsed_tx(&signer, tx, *chain_id)?,
+                        Leg::Message { text } => sign_message_with(&signer, text)?,
+                        Leg::Digest { digest, .. } => sign_digest_with(&signer, digest)?,
+                        Leg::TypedData { typed_data } => {
+                            sign_digest_with(&signer, &typed_data_signing_hash(typed_data)?)?
+                        }
+                        Leg::Psbt { .. } => return Err(evm_only()),
+                    });
                 }
-            });
-        }
-        drop(signer);
+                drop(signer);
+                out
+            }
+        };
 
         let n = out.len();
         r.results = Some(out);
@@ -479,9 +506,16 @@ impl Approvals {
 /// SHA-256 over OUR canonical re-encoding of the parsed intent — never over the
 /// requester's bytes, so reformatting, key order and whitespace cannot change
 /// what the commitment covers.
-fn commitment(intent: &Intent) -> Result<[u8; 32]> {
+fn commitment(intent: &Intent, prepared: &Prepared) -> Result<[u8; 32]> {
     let mut h = Sha256::new();
     h.update(b"logos-keystore-approval-v1\n");
+    if let Prepared::Psbt { checked, .. } = prepared {
+        h.update(b"group\n");
+        h.update(intent.group.trim().as_bytes());
+        h.update(b"\n");
+        h.update(&checked.canonical);
+        return Ok(h.finalize().into());
+    }
     h.update(intent.address.trim().to_lowercase().as_bytes());
     h.update(b"\n");
     for leg in &intent.legs {
@@ -522,6 +556,7 @@ fn commitment(intent: &Intent) -> Result<[u8; 32]> {
                 h.update(b"typed_data\n");
                 h.update(typed_data_signing_hash(typed_data)?.as_bytes());
             }
+            Leg::Psbt { .. } => return Err(evm_only()),
         }
         h.update(b"\n");
     }
@@ -531,7 +566,7 @@ fn commitment(intent: &Intent) -> Result<[u8; 32]> {
 /// The lines an approver shows, VERBATIM. Produced here because this is the
 /// only party that has parsed the intent — an approver cannot tell
 /// requester-supplied text from the signer's own.
-fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<String>)> {
+fn render(intent: &Intent, prepared: &Prepared, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<String>)> {
     // Two lists rather than one, so an approver can separate them WITHOUT parsing text.
     // The prefix stays on the claim for an approver that flattens them anyway.
     let mut claim = Vec::new();
@@ -540,6 +575,15 @@ fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<Str
     }
 
     let mut out = Vec::new();
+    if let Prepared::Psbt { checked, name } = prepared {
+        out.push(format!("Wallet: {name}"));
+        out.push(format!("Commitment: {}", hex::encode(bundle_id)));
+        out.push("1 item(s) to sign:".into());
+        for (k, line) in checked.lines.iter().enumerate() {
+            out.push(if k == 0 { format!("  [1] {line}") } else { format!("      {line}") });
+        }
+        return Ok((claim, out));
+    }
     out.push(format!("Account: {}", intent.address.trim()));
     out.push(format!("Commitment: {}", hex::encode(bundle_id)));
     out.push(format!("{} item(s) to sign:", intent.legs.len()));
@@ -588,9 +632,59 @@ fn render(intent: &Intent, bundle_id: &[u8; 32]) -> Result<(Vec<String>, Vec<Str
                 render_typed_data(typed_data, &mut out)?;
                 out.push(format!("      Signing hash: {}", typed_data_signing_hash(typed_data)?));
             }
+            Leg::Psbt { .. } => return Err(evm_only()),
         }
     }
     Ok((claim, out))
+}
+
+/// What an intent was read as, before it is committed to and shown.
+enum Prepared {
+    Evm,
+    /// A Bitcoin request: the keystore's reading of its PSBT, and the wallet's name.
+    Psbt { checked: btcpsbt::Checked, name: String },
+}
+
+fn evm_only() -> KeystoreError {
+    KeystoreError::InvalidParams("intent: a psbt leg needs a Bitcoin group, not an address".into())
+}
+
+/// Check the intent's shape and read a Bitcoin request's PSBT against its wallet.
+fn prepare(ks: Option<&Keystore>, intent: &Intent) -> Result<Prepared> {
+    let bitcoin = !intent.group.trim().is_empty();
+    if bitcoin == !intent.address.trim().is_empty() {
+        return Err(KeystoreError::InvalidParams(
+            "intent: name exactly one of address (EVM) or group (Bitcoin)".into(),
+        ));
+    }
+    if !bitcoin {
+        if intent.legs.iter().any(|l| matches!(l, Leg::Psbt { .. })) {
+            return Err(evm_only());
+        }
+        return Ok(Prepared::Evm);
+    }
+    let [Leg::Psbt { network, psbt }] = intent.legs.as_slice() else {
+        return Err(KeystoreError::InvalidParams("intent: a Bitcoin request carries exactly one psbt leg".into()));
+    };
+    let ks = ks.ok_or_else(|| KeystoreError::InvalidParams("intent: a psbt leg is read against the keystore".into()))?;
+    let (acct, name) = ks.bitcoin_account(intent.group.trim())?;
+    let net = acct.chain.network(network)?;
+    let parsed = btcpsbt::parse(psbt)?;
+    let checked = btcpsbt::check(&Secp256k1::verification_only(), &acct, net, &name, &parsed)?;
+    Ok(Prepared::Psbt { checked, name })
+}
+
+/// Sign a Bitcoin request's PSBT; the result is the PSBT with this wallet's signatures added.
+fn sign_psbt_leg(ks: &Keystore, intent: &Intent, password: &str) -> Result<String> {
+    let [Leg::Psbt { network, psbt }] = intent.legs.as_slice() else {
+        return Err(KeystoreError::InvalidParams("intent: a Bitcoin request carries exactly one psbt leg".into()));
+    };
+    let group = intent.group.trim();
+    let (acct, _) = ks.bitcoin_account(group)?;
+    acct.chain.network(network)?;
+    let mut parsed = btcpsbt::parse(psbt)?;
+    ks.sign_psbt(group, password, &acct, &mut parsed)?;
+    Ok(parsed.to_string())
 }
 
 /// The EIP-712 signing hash of a typed-data document, `0x`-hex. Parsed by alloy's own
@@ -1196,6 +1290,108 @@ mod tests {
         let huge = format!(r#"{{"address":"{ACCT0}","purpose":"{}","legs":[]}}"#, "a".repeat(MAX_INTENT_BYTES));
         assert!(ap.request("x", &huge).is_err());
         assert!(ap.request("x", &format!(r#"{{"address":"{ACCT0}","legs":[]}}"#)).is_err());
+    }
+
+    // ── Bitcoin requests ────────────────────────────────────────────────
+
+    use crate::btc::{Chain, Family};
+    use crate::keystore::BitcoinImport;
+
+    const ABANDON: &str =
+        "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn bitcoin_fixture(family: Family) -> (tempfile::TempDir, Keystore, Approvals, String, bitcoin::Psbt) {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let g = ks
+            .import_bitcoin(&BitcoinImport {
+                phrase: ABANDON,
+                bip39_passphrase: "",
+                family,
+                chain: Chain::Test,
+                account: 0,
+                password: "pw",
+                label: "Savings",
+            })
+            .unwrap();
+        let psbt = crate::psbt::tests::sample(&g.account);
+        (dir, ks, Approvals::new(), g.id, psbt)
+    }
+
+    fn psbt_intent(group: &str, network: &str, psbt: &bitcoin::Psbt) -> String {
+        format!(r#"{{"group":"{group}","purpose":"send","legs":[{{"kind":"psbt","network":"{network}","psbt":"{psbt}"}}]}}"#)
+    }
+
+    #[test]
+    fn a_bitcoin_request_is_read_shown_and_signed_by_the_keystore() {
+        for family in [Family::Segwit, Family::Taproot] {
+            let (_d, ks, mut ap, id, psbt) = bitcoin_fixture(family);
+            let (h, r) = ap.request_with(Some(&ks), "bitcoin_wallet_core_module", &psbt_intent(&id, "regtest", &psbt)).unwrap();
+            let v = ap.acknowledge(&h).unwrap();
+            let all = v.render_lines.join("\n");
+            assert!(all.starts_with("Wallet: \"Savings\"\nCommitment: "), "{all}");
+            assert!(all.contains(&format!("  [1] Bitcoin regtest · wallet \"Savings\", {}, account 0", family.describe())), "{all}");
+            assert!(all.contains("      Send 0.00120000 BTC to bcrt1"), "{all}");
+            assert!(all.contains("      Change 0.00028810 BTC back to this wallet"), "{all}");
+            assert!(all.contains("      Fee 1,190 sats"), "{all}");
+            assert_eq!(v.claim_lines, vec!["Purpose (claimed by the requester): send".to_string()]);
+
+            // A wrong password signs nothing and leaves the request on screen.
+            assert!(ap.approve(&ks, &h, &v.bundle_id, "wrong").is_err());
+            assert_eq!(ap.status(&h, &r).unwrap().0, "rendered");
+            assert_eq!(ap.approve(&ks, &h, &v.bundle_id, "pw").unwrap(), 1);
+
+            let signed = crate::psbt::parse(&ap.fetch_result(&h, &r).unwrap()[0]).unwrap();
+            assert_eq!(signed.unsigned_tx, psbt.unsigned_tx, "the transaction itself must not change");
+            for input in &signed.inputs {
+                match family {
+                    Family::Segwit => assert_eq!(input.partial_sigs.len(), 1),
+                    Family::Taproot => assert!(input.tap_key_sig.is_some()),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_bitcoin_request_names_its_wallet_and_carries_one_psbt() {
+        let (_d, ks, mut ap, id, psbt) = bitcoin_fixture(Family::Segwit);
+        let good = psbt_intent(&id, "regtest", &psbt);
+        // Read only against the keystore.
+        assert!(ap.request("x", &good).is_err());
+        let leg = format!(r#"{{"kind":"psbt","network":"regtest","psbt":"{psbt}"}}"#);
+        for bad in [
+            format!(r#"{{"group":"{id}","address":"{ACCT0}","legs":[{leg}]}}"#),
+            format!(r#"{{"legs":[{leg}]}}"#),
+            format!(r#"{{"address":"{ACCT0}","legs":[{leg}]}}"#),
+            format!(r#"{{"group":"{id}","legs":[{leg},{leg}]}}"#),
+            format!(r#"{{"group":"{id}","legs":[{{"kind":"message","text":"hi"}}]}}"#),
+        ] {
+            assert!(ap.request_with(Some(&ks), "x", &bad).is_err(), "{bad}");
+        }
+        // A test wallet never signs for mainnet.
+        assert!(ap.request_with(Some(&ks), "x", &psbt_intent(&id, "bitcoin", &psbt)).is_err());
+        assert!(ap.request_with(Some(&ks), "x", &good).is_ok());
+    }
+
+    #[test]
+    fn a_vault_holding_another_wallets_key_signs_nothing() {
+        let (dir, ks, mut ap, id, psbt) = bitcoin_fixture(Family::Segwit);
+        let other = ks
+            .import_bitcoin(&BitcoinImport {
+                phrase: "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong",
+                bip39_passphrase: "",
+                family: Family::Segwit,
+                chain: Chain::Test,
+                account: 0,
+                password: "pw",
+                label: "",
+            })
+            .unwrap();
+        let groups = dir.path().join("groups");
+        std::fs::copy(groups.join(format!("{}.json", other.id)), groups.join(format!("{id}.json"))).unwrap();
+        let (h, _) = ap.request_with(Some(&ks), "x", &psbt_intent(&id, "regtest", &psbt)).unwrap();
+        let v = ap.acknowledge(&h).unwrap();
+        assert!(ap.approve(&ks, &h, &v.bundle_id, "pw").is_err());
     }
 
     #[test]

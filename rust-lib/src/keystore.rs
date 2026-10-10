@@ -9,6 +9,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 
 use alloy::consensus::{SignableTransaction, TxEip1559, TxEnvelope, TxLegacy};
 use alloy::eips::eip2718::Encodable2718;
@@ -25,6 +26,7 @@ use zeroize::Zeroizing;
 
 use crate::ack::Unrecoverable;
 use crate::atomic;
+use crate::btc::{self, AccountPublic, AccountSecret, Chain, Family};
 use crate::hd::{self, Bip44Path, Seed};
 use crate::layout::{self, Doc, Root, Scan, Slot, StageKind};
 
@@ -408,7 +410,13 @@ impl Keystore {
         } else {
             self.stage_dir(id).join(Slot::staged_name(&StageKind::Group(id.to_string())))
         };
-        self.open_group_vault(&path, password).map(drop).map_err(|e| match e {
+        let bitcoin = self.get_groups()?.get(id).is_some_and(|g| g.family.is_some());
+        let opened = if bitcoin {
+            self.open_bitcoin_vault_at(&path, password).map(drop)
+        } else {
+            self.open_group_vault(&path, password).map(drop)
+        };
+        opened.map_err(|e| match e {
             KeystoreError::Vault(_) => KeystoreError::Refused(
                 "the password for this wallet's derivation key is not correct".into(),
             ),
@@ -868,6 +876,18 @@ pub struct Group {
     pub label: String,
     #[serde(rename = "createdMs", default)]
     pub created_ms: u64,
+    /// `bitcoin` or `bitcoin_taproot`. Absent on EVM groups, which is all older records hold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub family: Option<String>,
+    /// `main` or `test`, Bitcoin groups only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<String>,
+    /// The master fingerprint and the account xpub, Bitcoin groups only. Public, but they reveal the
+    /// wallet's whole history, as an EVM vault's filename reveals its address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fingerprint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xpub: Option<String>,
 }
 
 /// Where one account came from. Kept beside the vaults for the same reason labels are: a
@@ -1541,7 +1561,7 @@ impl Keystore {
         }
         let derivable: Vec<&String> = groups
             .iter()
-            .filter(|(_, g)| g.storage == Storage::Extkey)
+            .filter(|(_, g)| g.storage == Storage::Extkey && g.family.is_none())
             .map(|(id, _)| id)
             .collect();
         match derivable.as_slice() {
@@ -1561,6 +1581,11 @@ impl Keystore {
     /// Resolve a group that must be able to derive, and the BIP-44 account it is pinned to.
     fn derivable_group(&self, id: Option<&str>) -> Result<(String, Group, u32)> {
         let (id, g) = self.resolve_group(id)?;
+        if g.family.is_some() {
+            return Err(KeystoreError::Refused(format!(
+                "wallet {id} is a Bitcoin wallet; its addresses come from its descriptors, not from here"
+            )));
+        }
         if g.storage != Storage::Extkey {
             return Err(KeystoreError::Refused(format!(
                 "wallet {id} did not keep a derivation key — import its recovery phrase \
@@ -1616,6 +1641,10 @@ impl Keystore {
             // The name lives in its own document; this field is only what older builds wrote.
             label: String::new(),
             created_ms: now_ms(),
+            family: None,
+            chain: None,
+            fingerprint: None,
+            xpub: None,
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
@@ -1768,6 +1797,12 @@ impl Keystore {
     /// Accounts already derived are untouched; what ends is adding MORE without the phrase.
     pub fn forget_derivation(&self, group: &str) -> Result<Forgotten> {
         check_group_id(group)?;
+        // Readable bookkeeping only: an unreadable groups.json must not stop a key's removal.
+        if self.get_groups().is_ok_and(|g| g.get(group).is_some_and(|g| g.family.is_some())) {
+            return Err(KeystoreError::Refused(format!(
+                "wallet {group} is a Bitcoin wallet, and this key is its only one: forgetting it is deleting the wallet"
+            )));
+        }
         let removed_key = remove_path(&self.group_vault_path(group))?;
         let removed_staged = remove_path(&self.stage_dir(group))?;
         if !removed_key && !removed_staged {
@@ -1900,6 +1935,10 @@ impl Keystore {
                     used_passphrase: false,
                     label,
                     created_ms: 0,
+                    family: None,
+                    chain: None,
+                    fingerprint: None,
+                    xpub: None,
                 },
                 used_indices: Vec::new(),
                 account_count,
@@ -1975,6 +2014,184 @@ impl Keystore {
                 g.next_index = g.next_index.max(index.saturating_add(1));
             }
         })
+    }
+}
+
+// ── Bitcoin groups ───────────────────────────────────────────────────────────
+//
+// A Bitcoin group keeps its account key and its wallet's database key in its own vault, at the
+// group key's usual path. Its record holds the public half, so a request can be read without it.
+
+/// Everything a Bitcoin wallet's import needs.
+pub struct BitcoinImport<'a> {
+    pub phrase: &'a str,
+    pub bip39_passphrase: &'a str,
+    pub family: Family,
+    pub chain: Chain,
+    pub account: u32,
+    /// The vault's password: it guards the account key and the database key.
+    pub password: &'a str,
+    pub label: &'a str,
+}
+
+/// A Bitcoin wallet just made.
+#[derive(Clone, Debug)]
+pub struct BitcoinGroup {
+    pub id: String,
+    pub account: AccountPublic,
+}
+
+/// What a Bitcoin wallet's vault holds, as JSON inside the scrypt envelope.
+#[derive(Serialize, Deserialize)]
+struct BitcoinVault {
+    v: u32,
+    family: String,
+    #[serde(rename = "accountKey")]
+    account_key: String,
+    /// 32 random bytes, never derived from a key, that open the wallet core's database.
+    #[serde(rename = "databaseKey")]
+    database_key: String,
+}
+
+impl Drop for BitcoinVault {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.account_key.zeroize();
+        self.database_key.zeroize();
+    }
+}
+
+impl Keystore {
+    /// Make a Bitcoin wallet from a phrase. The vault lands after its record, and both roll back together.
+    pub fn import_bitcoin(&self, req: &BitcoinImport) -> Result<BitcoinGroup> {
+        if req.password.is_empty() {
+            return Err(KeystoreError::InvalidParams("a Bitcoin wallet's vault needs a password".into()));
+        }
+        check_displayable(req.label, "label")?;
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
+        let (secret, fingerprint) =
+            AccountSecret::from_seed(&secp, seed.as_secret(), req.family, req.chain, req.account)?;
+        drop(seed);
+        let account = AccountPublic {
+            family: req.family,
+            chain: req.chain,
+            account: req.account,
+            fingerprint,
+            xpub: secret.xpub(&secp),
+        };
+        let mut db_key = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), db_key.as_mut());
+        let vault = BitcoinVault {
+            v: 1,
+            family: req.family.as_str().into(),
+            account_key: secret.encode().to_string(),
+            database_key: hex::encode(&db_key[..]),
+        };
+        let text = Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
+        drop(vault);
+
+        let id = new_group_id();
+        let record = Group {
+            storage: Storage::Extkey,
+            path_prefix: format!("m/{}'/{}'/{}'", req.family.purpose(), req.chain.coin_type(), req.account),
+            next_index: 0,
+            retired: Vec::new(),
+            used_passphrase: !req.bip39_passphrase.is_empty(),
+            label: String::new(),
+            created_ms: now_ms(),
+            family: Some(req.family.as_str().into()),
+            chain: Some(req.chain.as_str().into()),
+            fingerprint: Some(fingerprint.to_string()),
+            xpub: Some(account.xpub.to_string()),
+        };
+        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            groups.insert(id.clone(), record)
+        })?;
+        let landed = (|| {
+            self.write_group_label(&id, req.label)?;
+            self.write_group_vault(&id, &text, req.password)
+        })();
+        landed.inspect_err(|_| {
+            let _ = remove_path(&self.group_vault_path(&id));
+            let _ = remove_path(&self.stage_dir(&id));
+            let _ = self.write_group_label(&id, "");
+            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| groups.remove(&id));
+        })?;
+        Ok(BitcoinGroup { id, account })
+    }
+
+    /// A Bitcoin group's public half and the name the signer shows for it, from its record alone.
+    pub fn bitcoin_account(&self, id: &str) -> Result<(AccountPublic, String)> {
+        check_group_id(id)?;
+        let groups = self.get_groups()?;
+        let g = groups.get(id).ok_or_else(|| KeystoreError::NotFound(format!("group {id}")))?;
+        let corrupt = |what: &str| KeystoreError::Corrupt("groups.json".into(), format!("wallet {id}: {what}"));
+        let family = Family::parse(g.family.as_deref().ok_or_else(|| {
+            KeystoreError::Refused(format!("wallet {id} is not a Bitcoin wallet"))
+        })?)?;
+        let chain = Chain::parse(g.chain.as_deref().unwrap_or_default()).map_err(|_| corrupt("no network"))?;
+        let account = btc::parse_account_path(&g.path_prefix, family, chain)?;
+        let fingerprint = g
+            .fingerprint
+            .as_deref()
+            .and_then(|f| bitcoin::bip32::Fingerprint::from_str(f).ok())
+            .ok_or_else(|| corrupt("no fingerprint"))?;
+        let xpub = g
+            .xpub
+            .as_deref()
+            .and_then(|x| bitcoin::bip32::Xpub::from_str(x).ok())
+            .filter(|x| x.depth == 3 && x.network == chain.kind())
+            .ok_or_else(|| corrupt("no account xpub"))?;
+        let name = self
+            .get_group_labels()?
+            .get(id)
+            .filter(|l| !l.trim().is_empty() && check_displayable(l, "label").is_ok())
+            .map_or_else(|| id.to_string(), |l| format!("\"{}\"", l.trim()));
+        Ok((AccountPublic { family, chain, account, fingerprint, xpub }, name))
+    }
+
+    /// The descriptors a wallet core builds its watch-only wallet from: receive, then change.
+    pub fn account_descriptors(&self, id: &str) -> Result<(String, String)> {
+        let (acct, _) = self.bitcoin_account(id)?;
+        Ok((acct.descriptor(0), acct.descriptor(1)))
+    }
+
+    /// Sign a PSBT with a Bitcoin group's key, opened from its vault for this call only.
+    pub fn sign_psbt(&self, id: &str, password: &str, acct: &AccountPublic, psbt: &mut bitcoin::Psbt) -> Result<()> {
+        let secret = self.open_bitcoin_key(id, password, acct)?;
+        crate::psbt::sign(&bitcoin::secp256k1::Secp256k1::new(), acct, &secret, psbt)
+    }
+
+    /// The account key, refused unless it is the one the record's xpub describes: a swapped vault signs nothing.
+    fn open_bitcoin_key(&self, id: &str, password: &str, acct: &AccountPublic) -> Result<AccountSecret> {
+        check_group_id(id)?;
+        if !self.scan()?.keys.iter().any(|k| k == id) {
+            return Err(KeystoreError::NotFound(format!("the key of wallet {id}")));
+        }
+        let vault = self.open_bitcoin_vault_at(&self.group_vault_path(id), password)?;
+        if vault.family != acct.family.as_str() {
+            return Err(KeystoreError::Vault("the vault is not this wallet's family".into()));
+        }
+        let secret = AccountSecret::decode(&vault.account_key, acct.chain)?;
+        if secret.xpub(&bitcoin::secp256k1::Secp256k1::new()) != acct.xpub {
+            return Err(KeystoreError::Refused(format!("the vault of wallet {id} holds another wallet's key")));
+        }
+        Ok(secret)
+    }
+
+    fn open_bitcoin_vault_at(&self, path: &Path, password: &str) -> Result<BitcoinVault> {
+        let raw = std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        check_kdf_params(&raw)?;
+        let bytes = Zeroizing::new(
+            eth_keystore::decrypt_key(path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?,
+        );
+        let vault: BitcoinVault = serde_json::from_slice(&bytes)
+            .map_err(|_| KeystoreError::Vault("not a Bitcoin wallet's vault".into()))?;
+        if vault.v != 1 {
+            return Err(KeystoreError::Vault(format!("unknown Bitcoin vault version {}", vault.v)));
+        }
+        Ok(vault)
     }
 }
 
@@ -2563,6 +2780,71 @@ mod tests {
         ks.forget_derivation(&group).unwrap();
         assert!(ks.delete_account(&ACCT0.to_string(), "pw").unwrap());
         (ks, group)
+    }
+
+    fn bitcoin_import(ks: &Keystore, family: Family) -> BitcoinGroup {
+        ks.import_bitcoin(&BitcoinImport {
+            phrase: TEST_MNEMONIC,
+            bip39_passphrase: "",
+            family,
+            chain: Chain::Test,
+            account: 0,
+            password: "pw",
+            label: "Savings",
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_bitcoin_wallet_keeps_its_key_in_its_vault_and_its_public_half_in_its_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let g = bitcoin_import(&ks, Family::Segwit);
+        assert!(ks.list_derivation_keys().unwrap().contains(&g.id));
+        let (acct, name) = ks.bitcoin_account(&g.id).unwrap();
+        assert_eq!(acct, g.account);
+        assert_eq!(name, "\"Savings\"");
+        let (external, internal) = ks.account_descriptors(&g.id).unwrap();
+        assert!(external.starts_with(&format!("wpkh([{}/84'/1'/0']tpub", acct.fingerprint)), "{external}");
+        assert!(internal.contains("/1/*)#"), "{internal}");
+        // The vault opens with its password only, and holds the key the record describes.
+        assert!(ks.open_bitcoin_key(&g.id, "wrong", &acct).is_err());
+        let secret = ks.open_bitcoin_key(&g.id, "pw", &acct).unwrap();
+        assert_eq!(secret.xpub(&bitcoin::secp256k1::Secp256k1::new()), acct.xpub);
+        // The account key is in the vault and nowhere in the record.
+        let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        assert!(!record.contains("tprv") && !record.contains("databaseKey"), "{record}");
+        assert!(record.contains("\"family\": \"bitcoin\""), "{record}");
+    }
+
+    #[test]
+    fn an_evm_group_record_is_written_exactly_as_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        ks.import_mnemonic_ex(&req(Storage::Extkey, 0)).unwrap();
+        let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        for field in ["family", "chain", "fingerprint", "xpub"] {
+            assert!(!record.contains(field), "{field} in {record}");
+        }
+    }
+
+    #[test]
+    fn a_bitcoin_wallet_is_refused_where_only_evm_derivation_belongs() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let g = bitcoin_import(&ks, Family::Taproot);
+        let e = ks.derive_next_account(Some(&g.id), "pw", "pw", 0).unwrap_err().to_string();
+        assert!(e.contains("Bitcoin wallet"), "{e}");
+        assert!(ks.preview_addresses(&g.id, "pw", 0, 0, 1).is_err());
+        // With only a Bitcoin wallet here, there is no EVM wallet to pick by default.
+        assert!(ks.derive_next_account(None, "pw", "pw", 0).is_err());
+        // Its key is its only copy, so forgetting it would delete the wallet.
+        let e = ks.forget_derivation(&g.id).unwrap_err().to_string();
+        assert!(e.contains("only one"), "{e}");
+        assert!(ks.list_derivation_keys().unwrap().contains(&g.id));
+        // Naming it proves custody with the Bitcoin vault's password.
+        assert!(ks.set_group_label(&rename_with_key(&g.id, "Spending", "wrong")).is_err());
+        ks.set_group_label(&rename_with_key(&g.id, "Spending", "pw")).unwrap();
     }
 
     #[test]
