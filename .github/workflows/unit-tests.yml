@@ -178,6 +178,7 @@ jobs:
             psbt::tests::a_false_input_amount_is_refused_before_anything_is_shown \
             psbt::tests::a_native_segwit_input_without_its_previous_transaction_is_refused \
             psbt::tests::a_foreign_input_is_refused \
+            psbt::tests::a_coin_spent_twice_is_refused \
             psbt::tests::a_sighash_other_than_all_is_refused \
             psbt::tests::script_paths_and_signed_inputs_are_refused \
             psbt::tests::signatures_verify_against_the_sighash_computed_independently \
