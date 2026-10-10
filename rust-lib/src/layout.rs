@@ -57,6 +57,8 @@ pub enum StageKind {
     Vault(String),
     /// `<ks>/groups/.stage-<id>` — a group's derivation key.
     Group(String),
+    /// `<ks>/groups/.stage-<phrase id>` — a kept recovery phrase.
+    Phrase(String),
     /// `<ks>/.stage-import-<nonce>` — scratch for a write we hand to a path-based library.
     Import(String),
 }
@@ -82,6 +84,9 @@ pub enum Slot {
     GroupKey(String),
     /// `<ks>/groups` — the key directory itself.
     GroupDir,
+    /// `<ks>/groups/<phrase id>.json` — a recovery phrase the person chose to keep, in its own
+    /// scrypt vault. Whole-wallet material for every account the phrase makes.
+    PhraseVault(String),
     Doc(Doc),
     Stage(StageKind),
     /// `<ks>/.lock` — cross-process exclusion for the bookkeeping read-modify-write.
@@ -95,9 +100,11 @@ impl Slot {
             Slot::Vault(addr) => PathBuf::from(format!("{addr}.json")),
             Slot::GroupKey(id) => Path::new("groups").join(format!("{id}.json")),
             Slot::GroupDir => PathBuf::from("groups"),
+            Slot::PhraseVault(id) => Path::new("groups").join(format!("{id}.json")),
             Slot::Doc(d) => PathBuf::from(d.file()),
             Slot::Stage(StageKind::Vault(addr)) => PathBuf::from(format!("{STAGE_PREFIX}{addr}")),
             Slot::Stage(StageKind::Group(id)) => Path::new("groups").join(format!("{STAGE_PREFIX}{id}")),
+            Slot::Stage(StageKind::Phrase(id)) => Path::new("groups").join(format!("{STAGE_PREFIX}{id}")),
             Slot::Stage(StageKind::Import(n)) => PathBuf::from(format!("{STAGE_PREFIX}{IMPORT_INFIX}{n}")),
             Slot::Lock => PathBuf::from(".lock"),
         }
@@ -107,7 +114,7 @@ impl Slot {
     pub fn staged_name(kind: &StageKind) -> String {
         match kind {
             StageKind::Vault(addr) => format!("{addr}.json"),
-            StageKind::Group(id) => format!("{id}.json"),
+            StageKind::Group(id) | StageKind::Phrase(id) => format!("{id}.json"),
             StageKind::Import(_) => IMPORT_FILE.to_string(),
         }
     }
@@ -174,6 +181,10 @@ pub struct Scan {
     pub keys: Vec<String>,
     /// Derivation keys left at `<ks>/groups/.stage-<id>/<id>.json`.
     pub staged: Vec<String>,
+    /// Kept recovery phrases at `<ks>/groups/<phrase id>.json`.
+    pub phrases: Vec<String>,
+    /// Kept phrases an interrupted write left at `<ks>/groups/.stage-<phrase id>/<phrase id>.json`.
+    pub staged_phrases: Vec<String>,
     /// Documents a write did not finish publishing. Explained, so they are not treated as
     /// key material — but reported, so they are never silently dropped either.
     pub doc_stages: Vec<String>,
@@ -197,6 +208,8 @@ impl Scan {
             &mut self.import_stages,
             &mut self.keys,
             &mut self.staged,
+            &mut self.phrases,
+            &mut self.staged_phrases,
             &mut self.doc_stages,
             &mut self.possible_keys,
             &mut self.unexplained,
@@ -217,7 +230,7 @@ impl Scan {
     }
 
     /// Everything here that could open a WHOLE wallet: live derivation keys, staged ones,
-    /// and unexplained material the evidence cannot rule out.
+    /// kept phrases at either path, and unexplained material the evidence cannot rule out.
     ///
     /// The ONE query a decision about minting asks. Reading a bucket instead asks where
     /// material sits; this asks what it could be, which is the question.
@@ -229,7 +242,21 @@ impl Scan {
             let k = StageKind::Group(id.clone());
             rel(Slot::Stage(k.clone()).rel().join(Slot::staged_name(&k)))
         }));
+        out.extend(self.phrases.iter().map(|id| rel(Slot::PhraseVault(id.clone()).rel())));
+        out.extend(self.staged_phrases.iter().map(|id| {
+            let k = StageKind::Phrase(id.clone());
+            rel(Slot::Stage(k.clone()).rel().join(Slot::staged_name(&k)))
+        }));
         out.extend(self.possible_keys.iter().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Kept phrase ids on disk, at either path. The set `forget_phrase` must be able to name.
+    pub fn phrase_ids(&self) -> Vec<String> {
+        let mut out = self.phrases.clone();
+        out.extend(self.staged_phrases.iter().cloned());
         out.sort();
         out.dedup();
         out
@@ -280,6 +307,9 @@ pub enum Entry {
     GroupDir,
     VaultStage(String),
     GroupStage(String),
+    PhraseVault(String),
+    StagedPhraseVault(String),
+    PhraseStage(String),
     ImportStage(String),
     ImportScratch(String),
     /// Not from any `Slot`. Treated as material until someone proves otherwise.
@@ -325,6 +355,11 @@ pub fn is_group_id(id: &str) -> bool {
     id.len() == 34 && id.starts_with("g_") && is_hex(&id[2..], 32)
 }
 
+/// A kept phrase's id: `p_` + 16 random bytes in hex, never derived from the phrase.
+pub fn is_phrase_id(id: &str) -> bool {
+    id.len() == 34 && id.starts_with("p_") && is_hex(&id[2..], 32)
+}
+
 /// A vault filename is the address as `vault_name` writes it: 40 lowercase hex, no `0x`.
 /// Anything else is unexplained rather than a vault — a name we could not have written
 /// does not name a file we can open.
@@ -334,6 +369,10 @@ fn vault_stem(name: &str) -> Option<String> {
 
 fn group_stem(name: &str) -> Option<String> {
     name.strip_suffix(".json").filter(|s| is_group_id(s)).map(str::to_string)
+}
+
+fn phrase_stem(name: &str) -> Option<String> {
+    name.strip_suffix(".json").filter(|s| is_phrase_id(s)).map(str::to_string)
 }
 
 /// Which staging directory a NAME denotes. The three shapes are distinguishable from each
@@ -346,6 +385,9 @@ fn stage_name(name: &str) -> Option<StageKind> {
     if is_hex(rest, 40) {
         return Some(StageKind::Vault(rest.into()));
     }
+    if is_phrase_id(rest) {
+        return Some(StageKind::Phrase(rest.into()));
+    }
     is_group_id(rest).then(|| StageKind::Group(rest.into()))
 }
 
@@ -355,7 +397,9 @@ fn stage_name(name: &str) -> Option<StageKind> {
 fn names_key_material(name: &str) -> bool {
     group_stem(name).is_some()
         || is_group_id(name)
-        || matches!(stage_name(name), Some(StageKind::Group(_)))
+        || phrase_stem(name).is_some()
+        || is_phrase_id(name)
+        || matches!(stage_name(name), Some(StageKind::Group(_) | StageKind::Phrase(_)))
 }
 
 /// What a password-less look at one entry's CONTENTS found. Its NAME is judged separately.
@@ -446,18 +490,25 @@ pub fn classify(rel: &[String], kind: Kind) -> Entry {
                 Entry::StagedVault(a)
             }
             Some(StageKind::Import(n)) if at(1) == IMPORT_FILE => Entry::ImportScratch(n),
-            None if at(0) == "groups" => match group_stem(at(1)) {
-                Some(id) => Entry::GroupKey(id),
-                None => Entry::Unexplained,
+            None if at(0) == "groups" => match (group_stem(at(1)), phrase_stem(at(1))) {
+                (Some(id), _) => Entry::GroupKey(id),
+                (_, Some(id)) => Entry::PhraseVault(id),
+                _ => Entry::Unexplained,
             },
             _ => Entry::Unexplained,
         },
         (2, Kind::Dir) => match (at(0), stage_name(at(1))) {
             ("groups", Some(StageKind::Group(id))) => Entry::GroupStage(id),
+            ("groups", Some(StageKind::Phrase(id))) => Entry::PhraseStage(id),
             _ => Entry::Unexplained,
         },
-        (3, Kind::File) if at(0) == "groups" => match (stage_name(at(1)), group_stem(at(2))) {
-            (Some(StageKind::Group(staged)), Some(id)) if staged == id => Entry::StagedGroupKey(id),
+        (3, Kind::File) if at(0) == "groups" => match stage_name(at(1)) {
+            Some(StageKind::Group(staged)) if group_stem(at(2)).as_deref() == Some(staged.as_str()) => {
+                Entry::StagedGroupKey(staged)
+            }
+            Some(StageKind::Phrase(staged)) if phrase_stem(at(2)).as_deref() == Some(staged.as_str()) => {
+                Entry::StagedPhraseVault(staged)
+            }
             _ => Entry::Unexplained,
         },
         // Symlinks and sockets are never recognised whatever they are named: following one
@@ -550,9 +601,16 @@ fn file(out: &mut Scan, rel: &[String], what: Entry, seen: Seen) {
         Entry::ImportStage(n) => out.import_stages.push(n),
         Entry::GroupKey(id) => out.keys.push(id),
         Entry::StagedGroupKey(id) => out.staged.push(id),
+        Entry::PhraseVault(id) => out.phrases.push(id),
+        Entry::StagedPhraseVault(id) => out.staged_phrases.push(id),
         Entry::DocStage => out.doc_stages.push(rel_str(rel)),
         // Explained and holding nothing of its own: the material inside is what gets filed.
-        Entry::Doc(_) | Entry::Lock | Entry::GroupDir | Entry::GroupStage(_) | Entry::ImportScratch(_) => {}
+        Entry::Doc(_)
+        | Entry::Lock
+        | Entry::GroupDir
+        | Entry::GroupStage(_)
+        | Entry::PhraseStage(_)
+        | Entry::ImportScratch(_) => {}
         Entry::Unexplained => {
             let path = rel_str(rel);
             if could_be_key(rel, seen) {
@@ -639,6 +697,7 @@ mod tests {
 
     const A: &str = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
     const G: &str = "g_0123456789abcdef0123456789abcdef";
+    const P: &str = "p_0123456789abcdef0123456789abcdef";
 
     fn parts(p: &Path) -> Vec<String> {
         p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect()
@@ -666,6 +725,9 @@ mod tests {
             (p(&format!("groups/{G}.json")), Kind::File, Entry::GroupKey(G.into())),
             (p(&format!("groups/.stage-{G}")), Kind::Dir, Entry::GroupStage(G.into())),
             (p(&format!("groups/.stage-{G}/{G}.json")), Kind::File, Entry::StagedGroupKey(G.into())),
+            (p(&format!("groups/{P}.json")), Kind::File, Entry::PhraseVault(P.into())),
+            (p(&format!("groups/.stage-{P}")), Kind::Dir, Entry::PhraseStage(P.into())),
+            (p(&format!("groups/.stage-{P}/{P}.json")), Kind::File, Entry::StagedPhraseVault(P.into())),
             (p(&format!(".stage-import-{n}")), Kind::Dir, Entry::ImportStage(n.clone())),
             (p(&format!(".stage-import-{n}/import.json")), Kind::File, Entry::ImportScratch(n)),
         ]
@@ -678,6 +740,7 @@ mod tests {
         let cases: Vec<(Slot, Entry)> = vec![
             (Slot::Vault(A.into()), Entry::Vault(A.into())),
             (Slot::GroupKey(G.into()), Entry::GroupKey(G.into())),
+            (Slot::PhraseVault(P.into()), Entry::PhraseVault(P.into())),
             (Slot::Doc(Doc::Groups), Entry::Doc(Doc::Groups)),
             (Slot::Doc(Doc::Accounts), Entry::Doc(Doc::Accounts)),
             (Slot::Doc(Doc::Labels), Entry::Doc(Doc::Labels)),
@@ -690,7 +753,7 @@ mod tests {
 
         // A stage is a DIRECTORY, and the file it comes to hold is a file. Both halves of
         // every stage kind round-trip, the import scratch included.
-        for kind in [StageKind::Vault(A.into()), StageKind::Group(G.into()), StageKind::import()] {
+        for kind in [StageKind::Vault(A.into()), StageKind::Group(G.into()), StageKind::Phrase(P.into()), StageKind::import()] {
             let dir = Slot::Stage(kind.clone()).rel();
             let inside = dir.join(Slot::staged_name(&kind));
             assert_ne!(classify(&parts(&dir), Kind::Dir), Entry::Unexplained, "{kind:?}");
@@ -737,6 +800,11 @@ mod tests {
             vec![".stage-import-nope"],
             vec!["groups", "backup.json"],
             vec!["groups", ".stage-g_0123456789abcdef0123456789abcdef", "elsewhere.json"],
+            // A phrase stage holding a group key, and the reverse: each holds only its own.
+            vec!["groups", ".stage-p_0123456789abcdef0123456789abcdef", "g_0123456789abcdef0123456789abcdef.json"],
+            vec!["groups", ".stage-g_0123456789abcdef0123456789abcdef", "p_0123456789abcdef0123456789abcdef.json"],
+            // A phrase vault anywhere but the key directory.
+            vec!["p_0123456789abcdef0123456789abcdef.json"],
             vec!["groups", "x", "y", "z"],
             // HOLE 2's own shapes: a directory at depth 2, and one where a key belongs.
             vec!["a", "b"],
@@ -774,12 +842,28 @@ mod tests {
     }
 
     #[test]
+    fn a_kept_phrase_is_key_material_at_either_path_and_never_a_group_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::new(dir.path().to_path_buf());
+        let groups = root.as_path().join("groups");
+        std::fs::create_dir_all(groups.join(format!(".stage-{P}"))).unwrap();
+        std::fs::write(groups.join(format!("{P}.json")), "{}").unwrap();
+        std::fs::write(groups.join(format!(".stage-{P}")).join(format!("{P}.json")), "{}").unwrap();
+        let s = scan(&root).unwrap();
+        assert_eq!((s.phrases.clone(), s.staged_phrases.clone()), (vec![P.to_string()], vec![P.to_string()]));
+        assert!(s.stray().is_empty(), "explained, so not stray: {s:?}");
+        assert_eq!(s.possible_key_material(), vec![format!("groups/.stage-{P}/{P}.json"), format!("groups/{P}.json")]);
+        assert_eq!(s.phrase_ids(), vec![P.to_string()]);
+        assert!(s.key_ids().is_empty(), "a phrase is not a wallet's key, so nothing reads it as an orphan");
+    }
+
+    #[test]
     fn severity_follows_what_the_material_could_be_and_not_where_it_sits() {
         // A1. The guard keyed on a PATH PREFIX, so the same vault one directory over was
         // described by this authority and ignored by the decision. Every name below could
         // name a key, so every one of them is possible key material wherever it sits.
         for parent in ["groups", "groups.bak", "locked", ".stage-g_0123456789abcdef0123456789abcdef", "x"] {
-            for name in [format!("{G}.json"), G.to_string(), format!(".stage-{G}")] {
+            for name in [format!("{G}.json"), G.to_string(), format!(".stage-{G}"), format!("{P}.json"), format!(".stage-{P}")] {
                 let rel = vec![parent.to_string(), name.clone()];
                 assert!(could_be_key(&rel, Seen::Nothing), "{parent}/{name} was called harmless");
             }

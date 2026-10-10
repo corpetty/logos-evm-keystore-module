@@ -19,7 +19,7 @@ use crate::ack::Unrecoverable;
 use crate::approval::Approvals;
 use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
-use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, Keystore, Storage};
+use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::BitcoinImport;
 use logos_signer_interface::jobs::JobTable;
@@ -204,8 +204,19 @@ pub trait KeystoreModule: Send + 'static {
     /// `{ group, password? }` → `{ ok, group, databaseKey }`, from its unlock when no password. Tier M.
     fn database_key(&mut self, params_json: String) -> String;
     /// A Bitcoin wallet from a phrase: `{ phrase, passphrase?, family, chain, account?, password,
-    /// label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`. Tier D.
+    /// label?, keepPhrase?: { password } }`, or `{ keptPhrase, phrasePassword, … }` in place of
+    /// `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }`. Tier D.
     fn import_bitcoin(&mut self, params_json: String) -> String;
+    /// A kept phrase's words, for the keys app to show: `{ phrase, password }` → `{ ok, phrase,
+    /// words }`. Tier D.
+    fn show_phrase(&mut self, params_json: String) -> String;
+    /// Remove a kept phrase, no password needed: `{ phrase }` → `{ ok, forgotten }`. Tier D.
+    fn forget_phrase(&mut self, params_json: String) -> String;
+    /// Every kept phrase: `{ ok, phrases: [{ id, groups, staged }] }`. Ungated: ids only.
+    fn list_phrases(&mut self) -> String;
+    /// A Bitcoin wallet's descriptors, for the keys app to show: `{ group }` → `{ ok, group,
+    /// external, internal }`. The custodian and the manager: an xpub shows the whole history.
+    fn account_descriptors(&mut self, params_json: String) -> String;
 
     /// Observability: what this module currently sees as its caller. Ungated
     /// and side-effect-free — identity cannot report its own absence.
@@ -285,6 +296,24 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
+/// The words to import, typed or opened from a kept phrase, and what the wallet records of them.
+fn words_and_keep<'a>(
+    ks: &Keystore,
+    typed: Zeroizing<String>,
+    kept: Option<&'a str>,
+    keep_password: Option<&'a str>,
+    phrase_password: &str,
+) -> std::result::Result<(Zeroizing<String>, KeepPhrase<'a>), String> {
+    match (kept, typed.trim().is_empty(), keep_password) {
+        (Some(id), true, None) => {
+            ks.show_phrase(id, phrase_password).map(|w| (w, KeepPhrase::Kept(id))).map_err(|e| e.to_string())
+        }
+        (None, false, keep) => Ok((typed, keep.map_or(KeepPhrase::No, KeepPhrase::New))),
+        (Some(_), _, _) => Err("keptPhrase replaces phrase, and is kept already".into()),
+        (None, true, _) => Err("name the phrase, or a kept one".into()),
+    }
+}
+
 /// Refused identically whether the handle is unknown or simply not yours, in
 /// content and in shape — a distinct message would answer "does this handle
 /// exist?" for a caller that has no business knowing.
@@ -346,6 +375,7 @@ impl KeystoreModuleImpl {
 
 #[derive(Deserialize)]
 struct ImportMnemonicParams {
+    #[serde(default)]
     phrase: String,
     #[serde(default)]
     passphrase: String,
@@ -364,6 +394,14 @@ struct ImportMnemonicParams {
     group_password: String,
     #[serde(default, alias = "groupLabel")]
     group_label: String,
+    /// Keep the phrase in a vault of its own, under this password.
+    #[serde(default, rename = "keepPhrase")]
+    keep_phrase: Option<PasswordParams>,
+    /// Make the wallet from a kept phrase rather than typed words.
+    #[serde(default, rename = "keptPhrase")]
+    kept_phrase: Option<String>,
+    #[serde(default, rename = "phrasePassword")]
+    phrase_password: String,
 }
 
 #[derive(Deserialize)]
@@ -455,6 +493,7 @@ struct DatabaseKeyParams {
 
 #[derive(Deserialize)]
 struct ImportBitcoinParams {
+    #[serde(default)]
     phrase: String,
     #[serde(default)]
     passphrase: String,
@@ -465,6 +504,26 @@ struct ImportBitcoinParams {
     password: String,
     #[serde(default)]
     label: String,
+    /// Keep the phrase in a vault of its own, under this password.
+    #[serde(default, rename = "keepPhrase")]
+    keep_phrase: Option<PasswordParams>,
+    /// Make the wallet from a kept phrase rather than typed words.
+    #[serde(default, rename = "keptPhrase")]
+    kept_phrase: Option<String>,
+    #[serde(default, rename = "phrasePassword")]
+    phrase_password: String,
+}
+
+#[derive(Deserialize)]
+struct PasswordParams {
+    password: String,
+}
+
+#[derive(Deserialize)]
+struct PhraseParams {
+    phrase: String,
+    #[serde(default)]
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -529,26 +588,41 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let res = match self.ks() {
-            Ok(ks) => ks.import_mnemonic_ex(&ImportRequest {
-                phrase: &p.phrase,
-                bip39_passphrase: &p.passphrase,
-                index: p.account_index,
-                password: &p.password,
-                storage,
-                bip44_account: p.bip44_account,
-                change: p.change,
-                group_password: &p.group_password,
-                group_label: &p.group_label,
-            }),
+        let (typed, passphrase, password) =
+            (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (keep_password, phrase_password, group_password) = (
+            Zeroizing::new(p.keep_phrase.map(|k| k.password)),
+            Zeroizing::new(p.phrase_password),
+            Zeroizing::new(p.group_password),
+        );
+        let ks = match self.ks() {
+            Ok(ks) => ks,
             Err(e) => return err(e),
         };
+        let (phrase, keep) =
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+        let res = ks.import_mnemonic_ex(&ImportRequest {
+            phrase: &phrase,
+            bip39_passphrase: &passphrase,
+            index: p.account_index,
+            password: &password,
+            storage,
+            bip44_account: p.bip44_account,
+            change: p.change,
+            group_password: &group_password,
+            group_label: &p.group_label,
+            keep,
+        });
         match res {
             Ok(d) => {
+                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&d.group).and_then(|r| r.phrase.clone()));
                 self.announce();
                 json!({ "ok": true, "address": d.address.to_string(), "path": d.path,
                         "group": d.group, "storage": storage.as_str(), "index": d.index,
-                        "origin": "derived" })
+                        "origin": "derived", "phrase": kept })
                 .to_string()
             }
             Err(e) => err(e),
@@ -730,6 +804,7 @@ impl KeystoreModule for KeystoreModuleImpl {
                             "accountCount": g.account_count, "derivable": g.derivable,
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
+                            "phrase": g.group.phrase,
                         })
                     })
                     .collect();
@@ -1270,12 +1345,23 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(p) => p,
             Err(e) => return e,
         };
-        let (phrase, passphrase, password) =
+        let (typed, passphrase, password) =
             (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (keep_password, phrase_password) =
+            (Zeroizing::new(p.keep_phrase.map(|k| k.password)), Zeroizing::new(p.phrase_password));
         let (family, chain) = match (BtcFamily::parse(&p.family), BtcChain::parse(&p.chain)) {
             (Ok(f), Ok(c)) => (f, c),
             (Err(e), _) | (_, Err(e)) => return err(e),
         };
+        let ks = match self.ks() {
+            Ok(ks) => ks,
+            Err(e) => return err(e),
+        };
+        let (phrase, keep) =
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
         let req = BitcoinImport {
             phrase: &phrase,
             bip39_passphrase: &passphrase,
@@ -1284,19 +1370,85 @@ impl KeystoreModule for KeystoreModuleImpl {
             account: p.account,
             password: &password,
             label: &p.label,
+            keep,
         };
-        let res = match self.ks() {
-            Ok(ks) => ks.import_bitcoin(&req),
-            Err(e) => return err(e),
-        };
-        match res {
+        match ks.import_bitcoin(&req) {
             Ok(g) => {
+                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&g.id).and_then(|r| r.phrase.clone()));
                 self.announce();
                 json!({ "ok": true, "group": g.id, "family": family.as_str(), "chain": chain.as_str(),
                         "path": format!("m/{}", g.account.origin().to_string().trim_start_matches("m/")),
                         "fingerprint": g.account.fingerprint.to_string(),
-                        "external": g.account.descriptor(0), "internal": g.account.descriptor(1) })
+                        "external": g.account.descriptor(0), "internal": g.account.descriptor(1),
+                        "phrase": kept })
                 .to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn show_phrase(&mut self, params_json: String) -> String {
+        if !self.may_mutate("show_phrase") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: PhraseParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        match self.ks().and_then(|ks| ks.show_phrase(&p.phrase, &password).map_err(|e| e.to_string())) {
+            Ok(words) => {
+                let reply = Zeroizing::new(json!({ "ok": true, "phrase": p.phrase, "words": words.as_str() }).to_string());
+                reply.to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn forget_phrase(&mut self, params_json: String) -> String {
+        if !self.may_mutate("forget_phrase") {
+            return not_authorized();
+        }
+        let p: PhraseParams = match serde_json::from_str(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        match self.ks().and_then(|ks| ks.forget_phrase(&p.phrase).map_err(|e| e.to_string())) {
+            Ok(forgotten) => {
+                self.announce();
+                json!({ "ok": true, "forgotten": forgotten }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn account_descriptors(&mut self, params_json: String) -> String {
+        if !self.reads_signer_state() {
+            return not_authorized();
+        }
+        #[derive(Deserialize)]
+        struct Wire {
+            group: String,
+        }
+        let w: Wire = match serde_json::from_str(&params_json) {
+            Ok(w) => w,
+            Err(e) => return err(e),
+        };
+        match self.ks().and_then(|ks| ks.account_descriptors(&w.group).map_err(|e| e.to_string())) {
+            Ok((external, internal)) => {
+                json!({ "ok": true, "group": w.group, "external": external, "internal": internal }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn list_phrases(&mut self) -> String {
+        match self.ks().and_then(|ks| ks.kept_phrases().map_err(|e| e.to_string())) {
+            Ok(kept) => {
+                let phrases: Vec<_> =
+                    kept.into_iter().map(|k| json!({ "id": k.id, "groups": k.groups, "staged": k.staged })).collect();
+                json!({ "ok": true, "phrases": phrases }).to_string()
             }
             Err(e) => err(e),
         }

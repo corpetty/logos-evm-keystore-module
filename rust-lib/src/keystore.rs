@@ -319,6 +319,7 @@ impl Keystore {
             change: 0,
             group_password: "",
             group_label: "",
+            keep: KeepPhrase::No,
         })
         .map(|d| d.address)
     }
@@ -888,6 +889,9 @@ pub struct Group {
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xpub: Option<String>,
+    /// The kept phrase this wallet was made from, when the person chose to keep it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phrase: Option<String>,
 }
 
 /// Where one account came from. Kept beside the vaults for the same reason labels are: a
@@ -1031,6 +1035,8 @@ pub struct ImportRequest<'a> {
     pub change: u32,
     pub group_password: &'a str,
     pub group_label: &'a str,
+    /// Keep the phrase too, or record one kept earlier. The BIP39 passphrase never is.
+    pub keep: KeepPhrase<'a>,
 }
 
 /// Everything a wallet rename needs. A struct because an `(address, password)` pair sits
@@ -1630,6 +1636,7 @@ impl Keystore {
         }
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
+        let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
         let record = Group {
@@ -1645,10 +1652,12 @@ impl Keystore {
             chain: None,
             fingerprint: None,
             xpub: None,
+            phrase: phrase.clone(),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
-        })?;
+        })
+        .inspect_err(|_| self.forget_new_phrase(made, &phrase))?;
 
         // The record goes down before the key, and both roll back together. A group whose
         // vault is missing reads as "not derivable", which is safe; a vault with no group
@@ -1671,6 +1680,7 @@ impl Keystore {
             let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
                 groups.remove(&id)
             });
+            self.forget_new_phrase(made, &phrase);
         })
     }
 
@@ -1939,6 +1949,7 @@ impl Keystore {
                     chain: None,
                     fingerprint: None,
                     xpub: None,
+                    phrase: None,
                 },
                 used_indices: Vec::new(),
                 account_count,
@@ -2032,6 +2043,17 @@ pub struct BitcoinImport<'a> {
     /// The vault's password: it guards the account key and the database key.
     pub password: &'a str,
     pub label: &'a str,
+    pub keep: KeepPhrase<'a>,
+}
+
+/// Whether a wallet's phrase is kept. The BIP39 passphrase never is.
+#[derive(Clone, Copy, Debug)]
+pub enum KeepPhrase<'a> {
+    No,
+    /// Keep it in a new vault, under this password of its own.
+    New(&'a str),
+    /// It is already kept, in the vault with this id; the wallet records it.
+    Kept(&'a str),
 }
 
 /// A Bitcoin wallet just made.
@@ -2091,6 +2113,9 @@ impl Keystore {
         let text = Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
         drop(vault);
 
+        let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
+        let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
+
         let id = new_group_id();
         let record = Group {
             storage: Storage::Extkey,
@@ -2104,10 +2129,12 @@ impl Keystore {
             chain: Some(req.chain.as_str().into()),
             fingerprint: Some(fingerprint.to_string()),
             xpub: Some(account.xpub.to_string()),
+            phrase: phrase.clone(),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
-        })?;
+        })
+        .inspect_err(|_| forget_new_phrase())?;
         let landed = (|| {
             self.write_group_label(&id, req.label)?;
             self.write_group_vault(&id, &text, req.password)
@@ -2117,6 +2144,7 @@ impl Keystore {
             let _ = remove_path(&self.stage_dir(&id));
             let _ = self.write_group_label(&id, "");
             let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| groups.remove(&id));
+            forget_new_phrase();
         })?;
         Ok(BitcoinGroup { id, account })
     }
@@ -2207,6 +2235,135 @@ impl Keystore {
             return Err(KeystoreError::Vault(format!("unknown Bitcoin vault version {}", vault.v)));
         }
         Ok(vault)
+    }
+}
+
+// ── Kept phrases ─────────────────────────────────────────────────────────────
+//
+// A recovery phrase the person chose to keep, in its own scrypt vault under a password of its
+// own, beside the group keys. Off unless asked for. Deleting the wallets made from it leaves it;
+// only `forget_phrase` removes it.
+
+/// A kept phrase, and the wallets whose records say they were made from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeptPhrase {
+    pub id: String,
+    pub groups: Vec<String>,
+    /// Only at the staging path, after an interrupted write. Still the whole phrase.
+    pub staged: bool,
+}
+
+fn check_phrase_id(id: &str) -> Result<()> {
+    if !layout::is_phrase_id(id) {
+        return Err(KeystoreError::InvalidParams(format!("invalid phrase id {id:?}")));
+    }
+    Ok(())
+}
+
+/// Random, like a group id: a phrase's fingerprint would correlate it across machines.
+fn new_phrase_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    format!("p_{}", hex::encode(b))
+}
+
+impl Keystore {
+    fn phrase_vault_path(&self, id: &str) -> PathBuf {
+        self.root.path(&Slot::PhraseVault(id.to_string()))
+    }
+
+    fn phrase_stage_dir(&self, id: &str) -> PathBuf {
+        self.root.path(&Slot::Stage(StageKind::Phrase(id.to_string())))
+    }
+
+    /// The kept phrase an import records, and whether this import made its vault.
+    fn phrase_to_record(&self, phrase: &str, keep: KeepPhrase) -> Result<(Option<String>, bool)> {
+        match keep {
+            KeepPhrase::No => Ok((None, false)),
+            KeepPhrase::New(password) => Ok((Some(self.keep_phrase(phrase, password)?), true)),
+            KeepPhrase::Kept(p) => {
+                check_phrase_id(p)?;
+                if !self.scan()?.phrases.iter().any(|k| k == p) {
+                    return Err(KeystoreError::NotFound(format!("kept phrase {p}")));
+                }
+                Ok((Some(p.to_string()), false))
+            }
+        }
+    }
+
+    /// Undo a phrase vault an import made, when the import itself failed.
+    fn forget_new_phrase(&self, made: bool, phrase: &Option<String>) {
+        if let (true, Some(p)) = (made, phrase) {
+            let _ = remove_path(&self.phrase_vault_path(p));
+            let _ = remove_path(&self.phrase_stage_dir(p));
+        }
+    }
+
+    /// Keep a phrase in a new vault, staged and renamed like a group key. Returns its id.
+    pub fn keep_phrase(&self, phrase: &str, password: &str) -> Result<String> {
+        if password.is_empty() {
+            return Err(KeystoreError::InvalidParams("keeping a phrase needs a password of its own".into()));
+        }
+        let words = hd::normalize_phrase(phrase)?;
+        let id = new_phrase_id();
+        self.ensure_group_dir()?;
+        let kind = StageKind::Phrase(id.clone());
+        let stage = atomic::Stage::create(self.phrase_stage_dir(&id)).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        let name = Slot::staged_name(&kind);
+        let mut rng = rand::thread_rng();
+        eth_keystore::encrypt_key(&stage.path(), &mut rng, words.as_bytes(), password, Some(&name))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        stage
+            .promote(&name, &self.phrase_vault_path(&id))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        Ok(id)
+    }
+
+    /// A kept phrase's words, with its password. Only the live vault answers.
+    pub fn show_phrase(&self, id: &str, password: &str) -> Result<Zeroizing<String>> {
+        check_phrase_id(id)?;
+        if !self.scan()?.phrases.iter().any(|p| p == id) {
+            return Err(KeystoreError::NotFound(format!("kept phrase {id}")));
+        }
+        let path = self.phrase_vault_path(id);
+        let raw = std::fs::read_to_string(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        check_kdf_params(&raw)?;
+        // One message for every way the vault fails to open, as `prove_custody` gives one.
+        let bytes = Zeroizing::new(eth_keystore::decrypt_key(&path, password).map_err(|_| {
+            KeystoreError::Refused("the password for this phrase is not correct".into())
+        })?);
+        let words = std::str::from_utf8(&bytes).map_err(|_| KeystoreError::Vault("not a phrase vault".into()))?;
+        hd::normalize_phrase(words).map_err(|_| KeystoreError::Vault("not a phrase vault".into()))
+    }
+
+    /// Remove a kept phrase at either path, and its mention from every wallet's record. No
+    /// password, like `forget_derivation`: removing a secret needs no proof of holding it.
+    pub fn forget_phrase(&self, id: &str) -> Result<bool> {
+        check_phrase_id(id)?;
+        let removed = remove_path(&self.phrase_vault_path(id))?;
+        let staged = remove_path(&self.phrase_stage_dir(id))?;
+        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            for g in groups.values_mut().filter(|g| g.phrase.as_deref() == Some(id)) {
+                g.phrase = None;
+            }
+        })?;
+        Ok(removed || staged)
+    }
+
+    /// Every kept phrase on disk, at either path, with the wallets made from it.
+    pub fn kept_phrases(&self) -> Result<Vec<KeptPhrase>> {
+        let scan = self.scan()?;
+        let groups = self.get_groups().unwrap_or_default();
+        Ok(scan
+            .phrase_ids()
+            .into_iter()
+            .map(|id| KeptPhrase {
+                groups: groups.iter().filter(|(_, g)| g.phrase.as_deref() == Some(id.as_str())).map(|(g, _)| g.clone()).collect(),
+                staged: !scan.phrases.contains(&id),
+                id,
+            })
+            .collect())
     }
 }
 
@@ -2761,6 +2918,7 @@ mod tests {
             change: 0,
             group_password: "gp",
             group_label: "Main",
+            keep: KeepPhrase::No,
         }
     }
 
@@ -2806,6 +2964,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "Savings",
+            keep: crate::keystore::KeepPhrase::No,
         })
         .unwrap()
     }
@@ -2830,6 +2989,138 @@ mod tests {
         let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
         assert!(!record.contains("tprv") && !record.contains("databaseKey"), "{record}");
         assert!(record.contains("\"family\": \"bitcoin\""), "{record}");
+    }
+
+    fn bitcoin_import_keeping(ks: &Keystore, phrase: &str, passphrase: &str, keep: KeepPhrase) -> Result<BitcoinGroup> {
+        ks.import_bitcoin(&BitcoinImport {
+            phrase,
+            bip39_passphrase: passphrase,
+            family: Family::Segwit,
+            chain: Chain::Test,
+            account: 0,
+            password: "pw",
+            label: "",
+            keep,
+        })
+    }
+
+    #[test]
+    fn a_phrase_is_kept_only_when_asked_and_shown_again_only_with_its_own_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let plain = bitcoin_import(&ks, Family::Segwit);
+        assert!(ks.kept_phrases().unwrap().is_empty(), "off unless asked for");
+        assert_eq!(ks.get_groups().unwrap()[&plain.id].phrase, None);
+
+        // Pasted with stray whitespace, kept as the words alone.
+        let pasted = format!("  {}\n", TEST_MNEMONIC.replace(' ', "  "));
+        let g = bitcoin_import_keeping(&ks, &pasted, "", KeepPhrase::New("phrase-pw")).unwrap();
+        let id = ks.get_groups().unwrap()[&g.id].phrase.clone().expect("the wallet records its phrase");
+        assert_eq!(ks.kept_phrases().unwrap(), vec![KeptPhrase { id: id.clone(), groups: vec![g.id.clone()], staged: false }]);
+        let wrong = ks.show_phrase(&id, "pw").unwrap_err();
+        assert!(wrong.to_string().contains("password for this phrase is not correct"), "the wallet's is not the phrase's: {wrong}");
+        assert_eq!(ks.show_phrase(&id, "phrase-pw").unwrap().as_str(), TEST_MNEMONIC);
+        // Key material wherever the scan looks, and never a stray.
+        let scan = ks.scan().unwrap();
+        assert!(scan.possible_key_material().iter().any(|m| m.contains(&id)), "{scan:?}");
+        assert!(scan.stray().is_empty(), "{scan:?}");
+    }
+
+    #[test]
+    fn a_kept_phrase_makes_more_wallets_and_outlives_them_until_forgotten() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let first = bitcoin_import_keeping(&ks, TEST_MNEMONIC, "", KeepPhrase::New("phrase-pw")).unwrap();
+        let id = ks.get_groups().unwrap()[&first.id].phrase.clone().unwrap();
+        let words = ks.show_phrase(&id, "phrase-pw").unwrap();
+        let second = ks
+            .import_bitcoin(&BitcoinImport {
+                phrase: &words,
+                bip39_passphrase: "",
+                family: Family::Taproot,
+                chain: Chain::Test,
+                account: 0,
+                password: "pw",
+                label: "",
+                keep: KeepPhrase::Kept(&id),
+            })
+            .unwrap();
+        let mut both = vec![first.id.clone(), second.id.clone()];
+        both.sort();
+        assert_eq!(ks.kept_phrases().unwrap()[0].groups, both, "one vault, both wallets name it");
+        assert!(bitcoin_import_keeping(&ks, TEST_MNEMONIC, "", KeepPhrase::Kept("p_00000000000000000000000000000000")).is_err());
+
+        // Forgetting needs no password, removes the vault, and clears every wallet's record.
+        assert!(ks.forget_phrase(&id).unwrap());
+        assert!(ks.kept_phrases().unwrap().is_empty());
+        assert!(ks.get_groups().unwrap().values().all(|g| g.phrase.is_none()));
+        assert!(ks.show_phrase(&id, "phrase-pw").is_err());
+        assert!(!ks.forget_phrase(&id).unwrap(), "nothing left to forget");
+        // The wallets themselves are untouched.
+        assert!(ks.bitcoin_account(&first.id).is_ok() && ks.bitcoin_account(&second.id).is_ok());
+    }
+
+    #[test]
+    fn the_bip39_passphrase_is_never_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let g = bitcoin_import_keeping(&ks, TEST_MNEMONIC, "second secret", KeepPhrase::New("phrase-pw")).unwrap();
+        let record = &ks.get_groups().unwrap()[&g.id];
+        assert!(record.used_passphrase, "the wallet says a passphrase was used");
+        let words = ks.show_phrase(record.phrase.as_deref().unwrap(), "phrase-pw").unwrap();
+        assert_eq!(words.as_str(), TEST_MNEMONIC, "the phrase, and nothing of the passphrase");
+        let groups = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
+        assert!(!groups.contains("second secret"), "{groups}");
+    }
+
+    #[test]
+    fn an_evm_wallet_keeps_its_phrase_when_asked_and_shares_one_kept_earlier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let d = ks.import_mnemonic_ex(&ImportRequest { keep: KeepPhrase::New("phrase-pw"), ..req(Storage::Extkey, 0) }).unwrap();
+        assert_eq!(d.address, ACCT0);
+        let id = ks.get_groups().unwrap()[&d.group].phrase.clone().expect("the wallet records its phrase");
+        assert_eq!(ks.show_phrase(&id, "phrase-pw").unwrap().as_str(), TEST_MNEMONIC);
+        // A Bitcoin wallet from the same kept phrase: one vault, both wallets name it.
+        let b = bitcoin_import_keeping(&ks, TEST_MNEMONIC, "", KeepPhrase::Kept(&id)).unwrap();
+        let mut both = vec![d.group.clone(), b.id.clone()];
+        both.sort();
+        assert_eq!(ks.kept_phrases().unwrap()[0].groups, both);
+        // An import that fails after keeping leaves no new phrase vault behind: an unreadable
+        // accounts.json refuses the account's key once the phrase is already kept.
+        let accounts = dir.path().join("accounts.json");
+        let saved = std::fs::read(&accounts).unwrap();
+        std::fs::write(&accounts, "not json").unwrap();
+        let failed = ks.import_mnemonic_ex(&ImportRequest { index: 1, keep: KeepPhrase::New("other-pw"), ..req(Storage::Extkey, 0) });
+        std::fs::write(&accounts, saved).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(ks.kept_phrases().unwrap().len(), 1, "{:?}", ks.kept_phrases());
+        assert!(ks.scan().unwrap().stray().is_empty());
+    }
+
+    #[test]
+    fn keeping_refuses_before_anything_is_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        assert!(bitcoin_import_keeping(&ks, TEST_MNEMONIC, "", KeepPhrase::New("")).is_err(), "a phrase needs its own password");
+        assert!(ks.keep_phrase("test test test", "pw").is_err(), "not a phrase");
+        assert!(ks.get_groups().unwrap().is_empty() && ks.kept_phrases().unwrap().is_empty());
+        assert!(ks.show_phrase("../groups", "pw").is_err() && ks.forget_phrase("g_0123456789abcdef0123456789abcdef").is_err());
+    }
+
+    #[test]
+    fn a_phrase_left_at_its_staging_path_is_listed_and_forgettable_but_never_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let id = ks.keep_phrase(TEST_MNEMONIC, "phrase-pw").unwrap();
+        // What a kill between the write and the rename leaves.
+        let stage = dir.path().join("groups").join(format!(".stage-{id}"));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::rename(dir.path().join("groups").join(format!("{id}.json")), stage.join(format!("{id}.json"))).unwrap();
+        assert_eq!(ks.kept_phrases().unwrap(), vec![KeptPhrase { id: id.clone(), groups: vec![], staged: true }]);
+        assert!(ks.show_phrase(&id, "phrase-pw").is_err(), "only the live vault answers");
+        assert!(ks.forget_phrase(&id).unwrap());
+        assert!(ks.scan().unwrap().possible_key_material().is_empty());
     }
 
     #[test]

@@ -477,6 +477,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "",
+                keep: crate::keystore::KeepPhrase::No,
             })
             .unwrap();
         }

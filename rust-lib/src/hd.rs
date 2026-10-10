@@ -182,6 +182,14 @@ impl Zeroize for Seed {
 
 impl ZeroizeOnDrop for Seed {}
 
+/// A BIP-39 English phrase with its whitespace normalized, refused unless its words and checksum
+/// are valid. What a kept phrase stores, so showing it again gives back exactly these words.
+pub fn normalize_phrase(phrase: &str) -> Result<Zeroizing<String>> {
+    let words = Zeroizing::new(phrase.split_whitespace().collect::<Vec<_>>().join(" "));
+    Mnemonic::<English>::new_from_phrase(&words).map_err(|e| KeystoreError::InvalidParams(format!("mnemonic: {e}")))?;
+    Ok(words)
+}
+
 impl Seed {
     /// BIP-39 phrase (+ optional passphrase) → seed.
     pub fn from_mnemonic(phrase: &str, bip39_passphrase: &str) -> Result<Self> {

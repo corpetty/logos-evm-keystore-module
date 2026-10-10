@@ -210,7 +210,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 |--------|--------|---------|-------------------|
 | `configure` | `config_json: String` | `{ ok, approvers, custodians, managers }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
-| `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
+| `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin, phrase }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `derive_account_at` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `preview_addresses` | `params_json: String` | `{ ok, group, addresses: [..] }` | no |
@@ -253,7 +253,11 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
 | `database_key` | `params_json: String` | `{ ok, group, databaseKey }` | no |
-| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal }` | yes → event |
+| `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase }` | yes → event |
+| `show_phrase` | `params_json: String` | `{ ok, phrase, words }` | no |
+| `forget_phrase` | `params_json: String` | `{ ok, forgotten }` | yes → event |
+| `list_phrases` | — | `{ ok, phrases: [{ id, groups, staged }] }` | no |
+| `account_descriptors` | `params_json: String` | `{ ok, group, external, internal }` | no |
 
 ---
 
@@ -338,7 +342,7 @@ create the account's **derivation group**. The argument is a **JSON object**
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
-| `phrase` | string | yes | The BIP-39 mnemonic |
+| `phrase` | string | yes, unless `keptPhrase` | The BIP-39 mnemonic |
 | `passphrase` | string | no (default `""`) | BIP-39 passphrase (the "25th word"). ASCII only — see below |
 | `accountIndex` (alias `account_index`) | u32 | no (default `0`) | The **address** index — the fifth path level |
 | `password` | string | yes | Vault password used to scrypt-encrypt the derived key on disk |
@@ -347,6 +351,9 @@ create the account's **derivation group**. The argument is a **JSON object**
 | `change` | u32 | no (default `0`) | `0` external, `1` change |
 | `groupPassword` | string | required when `storage` is `"extkey"` | Password for the group's own derivation-key vault |
 | `groupLabel` | string | no | Human name for the wallet |
+| `keepPhrase` | `{ password }` | no | Keep the phrase in a vault of its own, under this password. See [Kept recovery phrases](#kept-recovery-phrases) |
+| `keptPhrase` | string | no | Make the wallet from a phrase kept earlier, in place of `phrase` |
+| `phrasePassword` | string | with `keptPhrase` | The kept phrase's own password |
 
 `accountIndex` and `bip44Account` are **different levels** and the names are a
 trap worth reading twice: `accountIndex` predates the BIP-44 account level and
@@ -356,7 +363,7 @@ still means the address index.
 — nothing is retained and the group is recorded as not derivable. On success emits
 `accounts_changed`.
 
-**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/0", "group": "g_…", "storage": "plain", "index": 0, "origin": "derived" }`
+**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/0", "group": "g_…", "storage": "plain", "index": 0, "origin": "derived", "phrase": null }`; `phrase` is the kept phrase's id when one is kept or used
 **Error:** `{ "ok": false, "error": "<parse / derivation error>" }`
 
 ```bash
@@ -672,7 +679,9 @@ Claiming otherwise would be a lie about what is recoverable.
 | `plain` (default) | nothing | — adding an account later needs the phrase again |
 | `extkey` | the **account** key `m/44'/60'/<account>'`, in its own scrypt vault | every address under that one Ethereum account: both chains, every index, past and future |
 
-**The root key is never stored, returned, or accepted.** No method emits one, and
+**The root key is never stored, returned, or accepted** — unless the person chose to keep the
+recovery phrase, which is the root by another name ([Kept recovery phrases](#kept-recovery-phrases)).
+No method emits a root key, and
 `decode_account_key` refuses any extended key that is not at depth 3 — a group
 opened from a root would silently reach every SLIP-44 coin and every BIP-44
 account. The account key produces exactly the addresses this module can ever
@@ -933,7 +942,9 @@ account picker needs it.
   "accountCount": 3, "derivable": true, "stranded": false } ] }
 ```
 
-`usedPassphrase` is a **boolean, never the value**. `derivable` checks the vault
+`usedPassphrase` is a **boolean, never the value**. A Bitcoin wallet's row also carries `family`
+and `chain`, and any wallet made from a kept phrase carries its id as `phrase`
+([Kept recovery phrases](#kept-recovery-phrases)). `derivable` checks the vault
 *file*, not just the recorded choice, so a deleted key reads as "not derivable"
 rather than as a promise.
 
@@ -1099,7 +1110,8 @@ The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. T
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
 EVM records are written exactly as before; those fields are absent from them.
 
-`account_descriptors(group)` (a library call in K0) returns both descriptors with their BIP380
+`account_descriptors` (`{ group }`, for the configured manager or custodian, so the keys app can
+show a wallet's descriptor with its warning) returns both descriptors with their BIP380
 checksums. A Bitcoin wallet never exports a child key, which is what keeps showing its xpub
 safe; EVM groups still expose no xpub. EVM derivation refuses a Bitcoin group by name, and
 `forget_derivation` refuses one, because its vault holds the wallet's only key.
@@ -1161,7 +1173,9 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
 | `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
-| `import_bitcoin` | a configured **custodian** (Tier D) |
+| `import_bitcoin`, `show_phrase`, `forget_phrase` | a configured **custodian** (Tier D) |
+| `list_phrases` | anyone: ids and the wallets that name them, never words |
+| `account_descriptors` | a configured **manager** or **custodian**: a descriptor's xpub shows the wallet's whole history |
 
 Tier M is a registry like Tier D (`gate::TIER_M_METHODS`). It matters most for `unlock`: the
 manager keeps which apps an unlock covers and whether each signature is still confirmed, so a
@@ -1220,8 +1234,38 @@ opens; without it, the wallet's unlock answers, and opening uses no count.
 ### `import_bitcoin(params_json: String) -> String`
 
 `{ phrase, passphrase?, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", account?,
-password, label? }` → `{ ok, group, family, chain, path, fingerprint, external, internal }`, the
-two descriptors with their checksums. Tier D. See [Bitcoin wallets](#bitcoin-wallets-bip84-bip86).
+password, label?, keepPhrase?: { password } }` → `{ ok, group, family, chain, path, fingerprint,
+external, internal, phrase }`, the two descriptors with their checksums. Tier D. See [Bitcoin
+wallets](#bitcoin-wallets-bip84-bip86).
+
+`keepPhrase` keeps the phrase in a vault of its own under that password, and `phrase` in the
+reply is its id. `{ keptPhrase, phrasePassword }` in place of `phrase` makes another wallet from
+a phrase kept earlier: the vault opens with its own password, and the new wallet names it too.
+The passphrase is asked for again; it is never kept.
+
+### Kept recovery phrases
+
+Keeping the phrase is the person's choice, off unless asked for. What the keys app says next to
+it: *you can see the phrase again and add wallets without typing it. Someone with a copy of this
+keystore and this password gets every account of every coin this phrase makes, including ones
+never created here. Keep it only if you would keep the paper copy on this computer too.*
+
+- **One vault per phrase,** at `groups/<phrase id>.json`, beside the group keys and staged the
+  same way. Its own scrypt password, the same Web3 Secure Storage envelope, the words alone with
+  their whitespace normalized. The id is `p_` and 16 random bytes, never derived from the phrase.
+  The scan names it, at either path, as key material: `possible_key_material` includes it, and it
+  is never stray.
+- **Every wallet made from it names it** in its record (`phrase`). Deleting those wallets leaves
+  the phrase; `list_phrases` still lists it, and the keys app offers to forget it.
+- **The BIP39 passphrase is never kept.** A wallet made with one records only that one was used.
+- `show_phrase` (`{ phrase, password }` → `{ ok, phrase, words }`, Tier D) answers the keys app
+  alone, and only the live vault: a copy an interrupted write left at the staging path is listed
+  and forgettable, never shown.
+- `forget_phrase` (`{ phrase }` → `{ ok, forgotten }`, Tier D) removes the vault at either path
+  without a password, as `forget_derivation` removes a key, and clears it from every wallet's
+  record. It announces, because what `list_groups` shows moved.
+- `list_phrases` (ungated) lists every kept phrase with the wallets that name it and whether it
+  sits only at the staging path. Ids only; the words never leave `show_phrase`.
 
 ### Events
 
@@ -1251,8 +1295,8 @@ Every request is classified by the **caller identity** the platform reports
 |------|---------|--------|
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
-| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin` | a configured **custodian** (default `evm_keystore_ui`) |
+| **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase` | a configured **custodian** (default `evm_keystore_ui`) |
 | **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
@@ -1772,9 +1816,10 @@ Two properties make that total rather than nearly total:
 |------|------------|
 | `<addr>.json` | one account's scrypt vault |
 | `groups/<id>.json` | one group's derivation key |
+| `groups/<phrase id>.json` | a kept recovery phrase, when the person chose to keep one |
 | `groups.json`, `accounts.json`, `labels.json`, `group-labels.json` | bookkeeping sidecars |
 | `.stage-<addr>/` | an account vault mid-write |
-| `groups/.stage-<id>/` | a derivation key mid-write |
+| `groups/.stage-<id>/` | a derivation key, or a kept phrase, mid-write |
 | `.stage-import-<nonce>/import.json` | the caller's vault, mid-`import_keystore_json` |
 | `.ks-stage-*` | a document mid-write (random name, so two processes cannot collide) |
 | `.lock` | cross-process exclusion for the bookkeeping read-modify-write |
