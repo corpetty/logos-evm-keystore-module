@@ -210,7 +210,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 |--------|--------|---------|-------------------|
 | `configure` | `config_json: String` | `{ ok, approvers, custodians, managers }` | no — sets who may |
 | `create_mnemonic` | `words: i64` | `{ ok, phrase }` | no |
-| `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin }` | yes → event |
+| `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin, phrase }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `derive_account_at` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `preview_addresses` | `params_json: String` | `{ ok, group, addresses: [..] }` | no |
@@ -342,7 +342,7 @@ create the account's **derivation group**. The argument is a **JSON object**
 
 | Field | Type | Required | Meaning |
 |-------|------|----------|---------|
-| `phrase` | string | yes | The BIP-39 mnemonic |
+| `phrase` | string | yes, unless `keptPhrase` | The BIP-39 mnemonic |
 | `passphrase` | string | no (default `""`) | BIP-39 passphrase (the "25th word"). ASCII only — see below |
 | `accountIndex` (alias `account_index`) | u32 | no (default `0`) | The **address** index — the fifth path level |
 | `password` | string | yes | Vault password used to scrypt-encrypt the derived key on disk |
@@ -351,6 +351,9 @@ create the account's **derivation group**. The argument is a **JSON object**
 | `change` | u32 | no (default `0`) | `0` external, `1` change |
 | `groupPassword` | string | required when `storage` is `"extkey"` | Password for the group's own derivation-key vault |
 | `groupLabel` | string | no | Human name for the wallet |
+| `keepPhrase` | `{ password }` | no | Keep the phrase in a vault of its own, under this password. See [Kept recovery phrases](#kept-recovery-phrases) |
+| `keptPhrase` | string | no | Make the wallet from a phrase kept earlier, in place of `phrase` |
+| `phrasePassword` | string | with `keptPhrase` | The kept phrase's own password |
 
 `accountIndex` and `bip44Account` are **different levels** and the names are a
 trap worth reading twice: `accountIndex` predates the BIP-44 account level and
@@ -360,7 +363,7 @@ still means the address index.
 — nothing is retained and the group is recorded as not derivable. On success emits
 `accounts_changed`.
 
-**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/0", "group": "g_…", "storage": "plain", "index": 0, "origin": "derived" }`
+**Success:** `{ "ok": true, "address": "0x…", "path": "m/44'/60'/0'/0/0", "group": "g_…", "storage": "plain", "index": 0, "origin": "derived", "phrase": null }`; `phrase` is the kept phrase's id when one is kept or used
 **Error:** `{ "ok": false, "error": "<parse / derivation error>" }`
 
 ```bash

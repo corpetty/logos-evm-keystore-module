@@ -63,6 +63,8 @@ pub trait KeystoreCustodianModule: Send + 'static {
     fn identity(&mut self) -> String;
     /// `import_bitcoin`, with its document as given.
     fn bitcoin(&mut self, params_json: String) -> String;
+    /// `import_mnemonic`, with its document as given: an EVM wallet, from typed or kept words.
+    fn evm(&mut self, params_json: String) -> String;
     /// A kept phrase's words: `{ phrase, password }`.
     fn phrase(&mut self, params_json: String) -> String;
     /// `{ phrase }`: forget a kept phrase.
@@ -177,6 +179,10 @@ impl KeystoreCustodianModule for KeystoreCustodianModuleImpl {
 
     fn bitcoin(&mut self, params_json: String) -> String {
         pass(modules().keystore_module.import_bitcoin(&params_json))
+    }
+
+    fn evm(&mut self, params_json: String) -> String {
+        pass(modules().keystore_module.import_mnemonic(&params_json))
     }
 
     fn phrase(&mut self, params_json: String) -> String {

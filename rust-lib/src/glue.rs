@@ -296,6 +296,24 @@ fn err(e: impl std::fmt::Display) -> String {
     json!({ "ok": false, "error": e.to_string() }).to_string()
 }
 
+/// The words to import, typed or opened from a kept phrase, and what the wallet records of them.
+fn words_and_keep<'a>(
+    ks: &Keystore,
+    typed: Zeroizing<String>,
+    kept: Option<&'a str>,
+    keep_password: Option<&'a str>,
+    phrase_password: &str,
+) -> std::result::Result<(Zeroizing<String>, KeepPhrase<'a>), String> {
+    match (kept, typed.trim().is_empty(), keep_password) {
+        (Some(id), true, None) => {
+            ks.show_phrase(id, phrase_password).map(|w| (w, KeepPhrase::Kept(id))).map_err(|e| e.to_string())
+        }
+        (None, false, keep) => Ok((typed, keep.map_or(KeepPhrase::No, KeepPhrase::New))),
+        (Some(_), _, _) => Err("keptPhrase replaces phrase, and is kept already".into()),
+        (None, true, _) => Err("name the phrase, or a kept one".into()),
+    }
+}
+
 /// Refused identically whether the handle is unknown or simply not yours, in
 /// content and in shape — a distinct message would answer "does this handle
 /// exist?" for a caller that has no business knowing.
@@ -357,6 +375,7 @@ impl KeystoreModuleImpl {
 
 #[derive(Deserialize)]
 struct ImportMnemonicParams {
+    #[serde(default)]
     phrase: String,
     #[serde(default)]
     passphrase: String,
@@ -375,6 +394,14 @@ struct ImportMnemonicParams {
     group_password: String,
     #[serde(default, alias = "groupLabel")]
     group_label: String,
+    /// Keep the phrase in a vault of its own, under this password.
+    #[serde(default, rename = "keepPhrase")]
+    keep_phrase: Option<PasswordParams>,
+    /// Make the wallet from a kept phrase rather than typed words.
+    #[serde(default, rename = "keptPhrase")]
+    kept_phrase: Option<String>,
+    #[serde(default, rename = "phrasePassword")]
+    phrase_password: String,
 }
 
 #[derive(Deserialize)]
@@ -561,26 +588,41 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let res = match self.ks() {
-            Ok(ks) => ks.import_mnemonic_ex(&ImportRequest {
-                phrase: &p.phrase,
-                bip39_passphrase: &p.passphrase,
-                index: p.account_index,
-                password: &p.password,
-                storage,
-                bip44_account: p.bip44_account,
-                change: p.change,
-                group_password: &p.group_password,
-                group_label: &p.group_label,
-            }),
+        let (typed, passphrase, password) =
+            (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (keep_password, phrase_password, group_password) = (
+            Zeroizing::new(p.keep_phrase.map(|k| k.password)),
+            Zeroizing::new(p.phrase_password),
+            Zeroizing::new(p.group_password),
+        );
+        let ks = match self.ks() {
+            Ok(ks) => ks,
             Err(e) => return err(e),
         };
+        let (phrase, keep) =
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+        let res = ks.import_mnemonic_ex(&ImportRequest {
+            phrase: &phrase,
+            bip39_passphrase: &passphrase,
+            index: p.account_index,
+            password: &password,
+            storage,
+            bip44_account: p.bip44_account,
+            change: p.change,
+            group_password: &group_password,
+            group_label: &p.group_label,
+            keep,
+        });
         match res {
             Ok(d) => {
+                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&d.group).and_then(|r| r.phrase.clone()));
                 self.announce();
                 json!({ "ok": true, "address": d.address.to_string(), "path": d.path,
                         "group": d.group, "storage": storage.as_str(), "index": d.index,
-                        "origin": "derived" })
+                        "origin": "derived", "phrase": kept })
                 .to_string()
             }
             Err(e) => err(e),
@@ -1315,16 +1357,11 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(ks) => ks,
             Err(e) => return err(e),
         };
-        // The words typed now, or the words of a phrase kept earlier, opened with its own password.
-        let (phrase, keep) = match (&p.kept_phrase, typed.trim().is_empty(), keep_password.as_deref()) {
-            (Some(id), true, None) => match ks.show_phrase(id, &phrase_password) {
-                Ok(words) => (words, KeepPhrase::Kept(id)),
+        let (phrase, keep) =
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
+                Ok(v) => v,
                 Err(e) => return err(e),
-            },
-            (None, false, keep) => (typed, keep.map_or(KeepPhrase::No, KeepPhrase::New)),
-            (Some(_), _, _) => return err("keptPhrase replaces phrase, and is kept already"),
-            (None, true, _) => return err("name the phrase, or a kept one"),
-        };
+            };
         let req = BitcoinImport {
             phrase: &phrase,
             bip39_passphrase: &passphrase,

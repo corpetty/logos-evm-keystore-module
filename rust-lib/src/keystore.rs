@@ -319,6 +319,7 @@ impl Keystore {
             change: 0,
             group_password: "",
             group_label: "",
+            keep: KeepPhrase::No,
         })
         .map(|d| d.address)
     }
@@ -1034,6 +1035,8 @@ pub struct ImportRequest<'a> {
     pub change: u32,
     pub group_password: &'a str,
     pub group_label: &'a str,
+    /// Keep the phrase too, or record one kept earlier. The BIP39 passphrase never is.
+    pub keep: KeepPhrase<'a>,
 }
 
 /// Everything a wallet rename needs. A struct because an `(address, password)` pair sits
@@ -1633,6 +1636,7 @@ impl Keystore {
         }
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
+        let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
         let record = Group {
@@ -1648,11 +1652,12 @@ impl Keystore {
             chain: None,
             fingerprint: None,
             xpub: None,
-            phrase: None,
+            phrase: phrase.clone(),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             groups.insert(id.clone(), record)
-        })?;
+        })
+        .inspect_err(|_| self.forget_new_phrase(made, &phrase))?;
 
         // The record goes down before the key, and both roll back together. A group whose
         // vault is missing reads as "not derivable", which is safe; a vault with no group
@@ -1675,6 +1680,7 @@ impl Keystore {
             let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
                 groups.remove(&id)
             });
+            self.forget_new_phrase(made, &phrase);
         })
     }
 
@@ -2107,23 +2113,8 @@ impl Keystore {
         let text = Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
         drop(vault);
 
-        let (phrase, kept_now) = match req.keep {
-            KeepPhrase::No => (None, false),
-            KeepPhrase::New(password) => (Some(self.keep_phrase(req.phrase, password)?), true),
-            KeepPhrase::Kept(p) => {
-                check_phrase_id(p)?;
-                if !self.scan()?.phrases.iter().any(|k| k == p) {
-                    return Err(KeystoreError::NotFound(format!("kept phrase {p}")));
-                }
-                (Some(p.to_string()), false)
-            }
-        };
-        let forget_new_phrase = || {
-            if let (true, Some(p)) = (kept_now, &phrase) {
-                let _ = remove_path(&self.phrase_vault_path(p));
-                let _ = remove_path(&self.phrase_stage_dir(p));
-            }
-        };
+        let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
+        let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
 
         let id = new_group_id();
         let record = Group {
@@ -2284,6 +2275,29 @@ impl Keystore {
 
     fn phrase_stage_dir(&self, id: &str) -> PathBuf {
         self.root.path(&Slot::Stage(StageKind::Phrase(id.to_string())))
+    }
+
+    /// The kept phrase an import records, and whether this import made its vault.
+    fn phrase_to_record(&self, phrase: &str, keep: KeepPhrase) -> Result<(Option<String>, bool)> {
+        match keep {
+            KeepPhrase::No => Ok((None, false)),
+            KeepPhrase::New(password) => Ok((Some(self.keep_phrase(phrase, password)?), true)),
+            KeepPhrase::Kept(p) => {
+                check_phrase_id(p)?;
+                if !self.scan()?.phrases.iter().any(|k| k == p) {
+                    return Err(KeystoreError::NotFound(format!("kept phrase {p}")));
+                }
+                Ok((Some(p.to_string()), false))
+            }
+        }
+    }
+
+    /// Undo a phrase vault an import made, when the import itself failed.
+    fn forget_new_phrase(&self, made: bool, phrase: &Option<String>) {
+        if let (true, Some(p)) = (made, phrase) {
+            let _ = remove_path(&self.phrase_vault_path(p));
+            let _ = remove_path(&self.phrase_stage_dir(p));
+        }
     }
 
     /// Keep a phrase in a new vault, staged and renamed like a group key. Returns its id.
@@ -2904,6 +2918,7 @@ mod tests {
             change: 0,
             group_password: "gp",
             group_label: "Main",
+            keep: KeepPhrase::No,
         }
     }
 
@@ -3056,6 +3071,31 @@ mod tests {
         assert_eq!(words.as_str(), TEST_MNEMONIC, "the phrase, and nothing of the passphrase");
         let groups = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
         assert!(!groups.contains("second secret"), "{groups}");
+    }
+
+    #[test]
+    fn an_evm_wallet_keeps_its_phrase_when_asked_and_shares_one_kept_earlier() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let d = ks.import_mnemonic_ex(&ImportRequest { keep: KeepPhrase::New("phrase-pw"), ..req(Storage::Extkey, 0) }).unwrap();
+        assert_eq!(d.address, ACCT0);
+        let id = ks.get_groups().unwrap()[&d.group].phrase.clone().expect("the wallet records its phrase");
+        assert_eq!(ks.show_phrase(&id, "phrase-pw").unwrap().as_str(), TEST_MNEMONIC);
+        // A Bitcoin wallet from the same kept phrase: one vault, both wallets name it.
+        let b = bitcoin_import_keeping(&ks, TEST_MNEMONIC, "", KeepPhrase::Kept(&id)).unwrap();
+        let mut both = vec![d.group.clone(), b.id.clone()];
+        both.sort();
+        assert_eq!(ks.kept_phrases().unwrap()[0].groups, both);
+        // An import that fails after keeping leaves no new phrase vault behind: an unreadable
+        // accounts.json refuses the account's key once the phrase is already kept.
+        let accounts = dir.path().join("accounts.json");
+        let saved = std::fs::read(&accounts).unwrap();
+        std::fs::write(&accounts, "not json").unwrap();
+        let failed = ks.import_mnemonic_ex(&ImportRequest { index: 1, keep: KeepPhrase::New("other-pw"), ..req(Storage::Extkey, 0) });
+        std::fs::write(&accounts, saved).unwrap();
+        assert!(failed.is_err());
+        assert_eq!(ks.kept_phrases().unwrap().len(), 1, "{:?}", ks.kept_phrases());
+        assert!(ks.scan().unwrap().stray().is_empty());
     }
 
     #[test]
