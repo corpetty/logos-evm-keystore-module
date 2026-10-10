@@ -535,7 +535,9 @@ mod tests {
         s.unlock(&accounts[0].id, "pw", Some(Duration::from_secs(900)), None).unwrap();
         s.unlock(&accounts[1].id, "pw", None, None).unwrap();
         assert_eq!(s.unlocks.list().len(), 2);
-        assert!(s.unlocks.list()[0].expires_in_ms.unwrap() > 899_000);
+        // Opening each vault takes real time; the skewed clock decides the expiry, not a sleep.
+        let left = s.unlocks.list()[0].expires_in_ms.unwrap();
+        assert!((800_000..=900_000).contains(&left), "{left}");
         s.unlocks.advance(Duration::from_secs(901));
         let (req, _) = hash_request(&accounts[0], None);
         assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Locked, "expired");
