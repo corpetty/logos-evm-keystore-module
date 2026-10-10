@@ -204,6 +204,15 @@ pub trait KeystoreModule: Send + 'static {
     /// password? }` → `{ ok, group, databaseKey, origin, birthday }`, from its unlock when no
     /// password. Tier M.
     fn database_key(&mut self, params_json: String) -> String;
+    /// The database key of a Bitcoin wallet whose key is on a device, for an open the keys app
+    /// approved. The first open makes it under the password the person set: `{ signer, account,
+    /// password, birthday? }` → `{ ok, signer, account, databaseKey, origin, birthday, created }`. Tier M.
+    fn device_database_key(&mut self, params_json: String) -> String;
+    /// The device accounts with a database key here: `{ ok, wallets: [{ signer, account,
+    /// birthday, createdMs }] }`. The manager and the custodian.
+    fn device_wallets(&mut self) -> String;
+    /// Forget a device account's database key: `{ signer, account }` → `{ ok, forgotten }`. Tier D.
+    fn forget_device_wallet(&mut self, params_json: String) -> String;
     /// A Bitcoin wallet from a phrase: `{ phrase, passphrase?, family, chain, account?, password,
     /// label?, keepPhrase?: { password }, origin?, birthday? }`, or `{ keptPhrase, phrasePassword, … }`
     /// in place of `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal,
@@ -491,6 +500,21 @@ struct DatabaseKeyParams {
     group: String,
     #[serde(default)]
     password: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceKeyParams {
+    signer: String,
+    account: String,
+    password: String,
+    #[serde(default)]
+    birthday: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceWalletParams {
+    signer: String,
+    account: String,
 }
 
 #[derive(Deserialize)]
@@ -1347,6 +1371,70 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok((origin, birthday)) => json!({ "ok": true, "group": p.group, "databaseKey": key.as_str(),
                                               "origin": origin, "birthday": birthday })
             .to_string(),
+            Err(e) => err(e),
+        }
+    }
+
+    fn device_database_key(&mut self, params_json: String) -> String {
+        if !self.is_manager("device_database_key") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: DeviceKeyParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        let birthday = p.birthday.as_deref().map(str::trim).filter(|b| !b.is_empty());
+        let opened = self.ks().map_err(|e| err(e)).and_then(|ks| {
+            ks.device_database_key(&p.signer, &p.account, &password, birthday)
+                .map_err(|e| wire::err(&crate::signer::from_keystore(e)))
+        });
+        match opened {
+            Ok(k) => {
+                // A new vault moves what the keys app shows for that device account.
+                if k.created {
+                    self.announce();
+                }
+                json!({ "ok": true, "signer": p.signer, "account": p.account, "databaseKey": k.database_key.as_str(),
+                        "origin": "restored", "birthday": k.birthday, "created": k.created })
+                .to_string()
+            }
+            Err(reply) => reply,
+        }
+    }
+
+    fn device_wallets(&mut self) -> String {
+        if !self.reads_signer_state() {
+            return not_authorized();
+        }
+        match self.ks().and_then(|ks| ks.device_wallets().map_err(|e| e.to_string())) {
+            Ok(list) => {
+                let wallets: Vec<_> = list
+                    .into_iter()
+                    .map(|(_, w)| {
+                        json!({ "signer": w.signer, "account": w.account, "birthday": w.birthday, "createdMs": w.created_ms })
+                    })
+                    .collect();
+                json!({ "ok": true, "wallets": wallets }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn forget_device_wallet(&mut self, params_json: String) -> String {
+        if !self.may_mutate("forget_device_wallet") {
+            return not_authorized();
+        }
+        let p: DeviceWalletParams = match serde_json::from_str(&params_json) {
+            Ok(p) => p,
+            Err(e) => return err(e),
+        };
+        match self.ks().and_then(|ks| ks.forget_device_wallet(&p.signer, &p.account).map_err(|e| e.to_string())) {
+            Ok(forgotten) => {
+                self.announce();
+                json!({ "ok": true, "forgotten": forgotten }).to_string()
+            }
             Err(e) => err(e),
         }
     }

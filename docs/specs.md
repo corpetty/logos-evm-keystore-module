@@ -253,6 +253,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `lock` | `params_json: String` | `{ ok, locked }` | no |
 | `unlocked` | — | `{ ok, unlocked: [..] }` | no |
 | `database_key` | `params_json: String` | `{ ok, group, databaseKey, origin, birthday }` | no |
+| `device_database_key` | `params_json: String` | `{ ok, signer, account, databaseKey, origin, birthday, created }` | the first open makes a vault → event |
+| `device_wallets` | — | `{ ok, wallets: [{ signer, account, birthday, createdMs }] }` | no |
+| `forget_device_wallet` | `params_json: String` | `{ ok, forgotten }` | yes → event |
 | `import_bitcoin` | `params_json: String` | `{ ok, group, family, chain, path, fingerprint, external, internal, phrase, origin, birthday }` | yes → event |
 | `show_phrase` | `params_json: String` | `{ ok, phrase, words }` | no |
 | `forget_phrase` | `params_json: String` | `{ ok, forgotten }` | yes → event |
@@ -1183,8 +1186,9 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
-| `import_bitcoin`, `show_phrase`, `forget_phrase` | a configured **custodian** (Tier D) |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
+| `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
 | `account_descriptors` | a configured **manager** or **custodian**: a descriptor's xpub shows the wallet's whole history |
 
@@ -1242,6 +1246,38 @@ deleted account end the account's unlock, and nothing about an unlock is written
 random bytes for the wallet core's database, for an open request the keys app approved, with where
 its history starts (`birthday` is `null` when unknown). With `password` the vault opens; without
 it, the wallet's unlock answers, and opening uses no count.
+
+### Device wallets' database keys
+
+A Bitcoin wallet whose key is on a device, such as a Keycard Shell, still needs a key for its
+wallet core's encrypted database. The keystore keeps one per device account, in a vault of its
+own under a password the person sets the first time the wallet is opened for an app. It opens the
+wallet core's records and nothing else: no coin, no signature. The device signs.
+
+- **`device_database_key`** (`{ signer, account, password, birthday? }`, Tier M): the manager
+  calls it for an open the keys app approved, naming the signer module that offers the account
+  and the account's id there.
+  - The first open makes the vault: 32 random bytes under `password`, with the `birthday` the
+    person gave, if any.
+  - Every later open needs that password, and keeps the first birthday.
+  - A wrong password is `wrong_secret`, with one message for every way the vault fails to open.
+  - The reply is `{ ok, signer, account, databaseKey, origin: "restored", birthday, created }`.
+    A device account is always `restored`: a device keeps no record of when its seed was made.
+- **`device_wallets`** (the manager and the custodian): which device accounts have a vault, with
+  their birthdays. Never a key.
+- **`forget_device_wallet`** (`{ signer, account }`, Tier D): removes the vault and its record
+  without a password, the escape from a forgotten one. What the old key opened can no longer be
+  read, so a wallet core starts its records over. The next open makes a new vault.
+
+**What is kept.** The vault sits at `groups/<device id>.json`, where the id is `d_` plus 16 random
+bytes, never derived from the account. It is staged and renamed like a group key, and holds
+`{ v: 1, databaseKey }` in the same scrypt envelope. `device-wallets.json` maps each id to its
+signer, account, creation time and birthday. The scan explains both paths, staged and live. A
+database key is not key material: it is never counted among what could open a whole wallet.
+
+A record whose vault never landed, from an interrupted first open, is no wallet: the next open
+removes it and makes the vault afresh. The same account id under another signer module is
+another wallet.
 
 ### `import_bitcoin(params_json: String) -> String`
 
@@ -1312,7 +1348,7 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
 | **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
@@ -1833,9 +1869,10 @@ Two properties make that total rather than nearly total:
 | `<addr>.json` | one account's scrypt vault |
 | `groups/<id>.json` | one group's derivation key |
 | `groups/<phrase id>.json` | a kept recovery phrase, when the person chose to keep one |
-| `groups.json`, `accounts.json`, `labels.json`, `group-labels.json` | bookkeeping sidecars |
+| `groups/<device id>.json` | a device wallet's database key, once it was opened for an app |
+| `groups.json`, `accounts.json`, `labels.json`, `group-labels.json`, `device-wallets.json` | bookkeeping sidecars |
 | `.stage-<addr>/` | an account vault mid-write |
-| `groups/.stage-<id>/` | a derivation key, or a kept phrase, mid-write |
+| `groups/.stage-<id>/` | a derivation key, a kept phrase, or a device wallet's database key, mid-write |
 | `.stage-import-<nonce>/import.json` | the caller's vault, mid-`import_keystore_json` |
 | `.ks-stage-*` | a document mid-write (random name, so two processes cannot collide) |
 | `.lock` | cross-process exclusion for the bookkeeping read-modify-write |

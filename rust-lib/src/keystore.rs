@@ -2464,6 +2464,184 @@ impl Keystore {
     }
 }
 
+// ── Device wallets' database keys ────────────────────────────────────────────
+//
+// A Bitcoin wallet whose key is on a device still needs a key for its wallet core's database. The
+// keystore keeps one per device account, in its own scrypt vault under a password the person sets
+// the first time the wallet is opened. It opens the wallet core's records, never a coin.
+
+/// Which device account a database-key vault belongs to, in `device-wallets.json`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceWallet {
+    /// The signer module that offers the account, such as `keycard_shell_module`.
+    pub signer: String,
+    /// The account's id in that module.
+    pub account: String,
+    #[serde(rename = "createdMs", default)]
+    pub created_ms: u64,
+    /// The first day the wallet could have received coins, `YYYY-MM-DD`, if the person gave it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub birthday: Option<String>,
+}
+
+/// A device wallet's database key, opened, or made by this open.
+pub struct DeviceKey {
+    pub database_key: Zeroizing<String>,
+    pub birthday: Option<String>,
+    pub created: bool,
+}
+
+/// What a device wallet's vault holds, as JSON inside the scrypt envelope.
+#[derive(Serialize, Deserialize)]
+struct DeviceVaultDoc {
+    v: u32,
+    #[serde(rename = "databaseKey")]
+    database_key: String,
+}
+
+impl Drop for DeviceVaultDoc {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.database_key.zeroize();
+    }
+}
+
+/// Random, like a group id: an id derived from the account would correlate it across machines.
+fn new_device_id() -> String {
+    use rand::RngCore;
+    let mut b = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut b);
+    format!("d_{}", hex::encode(b))
+}
+
+fn check_device_name(value: &str, what: &str) -> Result<()> {
+    if value.trim().is_empty() || value.len() > 128 {
+        return Err(KeystoreError::InvalidParams(format!("a device wallet needs its {what}, up to 128 characters")));
+    }
+    check_displayable(value, what)
+}
+
+impl Keystore {
+    fn device_wallets_path(&self) -> PathBuf {
+        self.root.path(&Slot::Doc(Doc::DeviceWallets))
+    }
+
+    fn device_vault_path(&self, id: &str) -> PathBuf {
+        self.root.path(&Slot::DeviceVault(id.to_string()))
+    }
+
+    fn device_stage_dir(&self, id: &str) -> PathBuf {
+        self.root.path(&Slot::Stage(StageKind::Device(id.to_string())))
+    }
+
+    fn device_records(&self) -> Result<BTreeMap<String, DeviceWallet>> {
+        self.read_json(&self.device_wallets_path())
+    }
+
+    /// The device wallets whose database key is on disk, by vault id.
+    pub fn device_wallets(&self) -> Result<Vec<(String, DeviceWallet)>> {
+        let live = self.scan()?.devices;
+        Ok(self.device_records()?.into_iter().filter(|(id, _)| live.contains(id)).collect())
+    }
+
+    /// A device wallet's database key. The first open makes it, under `password` and with the
+    /// birthday the person gave; every later one needs that password and keeps the first birthday.
+    pub fn device_database_key(
+        &self,
+        signer: &str,
+        account: &str,
+        password: &str,
+        birthday: Option<&str>,
+    ) -> Result<DeviceKey> {
+        check_device_name(signer, "signer")?;
+        check_device_name(account, "account")?;
+        if password.is_empty() {
+            return Err(KeystoreError::InvalidParams("a device wallet's database key needs a password".into()));
+        }
+        let live = self.scan()?.devices;
+        let found = self.device_records()?.into_iter().find(|(_, w)| w.signer == signer && w.account == account);
+        if let Some((id, w)) = found.as_ref().filter(|(id, _)| live.contains(id)) {
+            let database_key = self.open_device_vault(id, password)?;
+            return Ok(DeviceKey { database_key, birthday: w.birthday.clone(), created: false });
+        }
+        if let Some(day) = birthday {
+            check_birthday(day)?;
+        }
+        // A record whose vault never landed is an interrupted first open: start it over.
+        if let Some((stale, _)) = found {
+            self.forget_device_id(&stale)?;
+        }
+        let id = new_device_id();
+        let record =
+            DeviceWallet { signer: signer.into(), account: account.into(), created_ms: now_ms(), birthday: birthday.map(str::to_string) };
+        self.update(&self.device_wallets_path(), |ws: &mut BTreeMap<String, DeviceWallet>| ws.insert(id.clone(), record.clone()))?;
+        let mut raw = Zeroizing::new([0u8; 32]);
+        rand::RngCore::fill_bytes(&mut rand::thread_rng(), raw.as_mut());
+        let database_key = Zeroizing::new(hex::encode(&raw[..]));
+        self.write_device_vault(&id, &database_key, password).inspect_err(|_| {
+            let _ = self.forget_device_id(&id);
+        })?;
+        Ok(DeviceKey { database_key, birthday: record.birthday, created: true })
+    }
+
+    /// Staged and renamed like a group key, so a kill leaves something the scan can name.
+    fn write_device_vault(&self, id: &str, database_key: &str, password: &str) -> Result<()> {
+        let doc = DeviceVaultDoc { v: 1, database_key: database_key.to_string() };
+        let text = Zeroizing::new(serde_json::to_string(&doc).map_err(|e| KeystoreError::Vault(e.to_string()))?);
+        drop(doc);
+        self.ensure_group_dir()?;
+        let kind = StageKind::Device(id.to_string());
+        let stage = atomic::Stage::create(self.device_stage_dir(id)).map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        let name = Slot::staged_name(&kind);
+        eth_keystore::encrypt_key(&stage.path(), &mut rand::thread_rng(), text.as_bytes(), password, Some(&name))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))?;
+        stage
+            .promote(&name, &self.device_vault_path(id))
+            .map_err(|e| KeystoreError::Vault(e.to_string()))
+    }
+
+    fn open_device_vault(&self, id: &str, password: &str) -> Result<Zeroizing<String>> {
+        let path = self.device_vault_path(id);
+        let raw = std::fs::read_to_string(&path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        check_kdf_params(&raw)?;
+        // One message for every way the vault fails to open: no oracle.
+        let bad = || KeystoreError::Vault("the password for this wallet's database key is not correct".into());
+        let bytes = Zeroizing::new(eth_keystore::decrypt_key(&path, password).map_err(|_| bad())?);
+        let doc: DeviceVaultDoc = serde_json::from_slice(&bytes).map_err(|_| bad())?;
+        if doc.v != 1 || doc.database_key.len() != 64 {
+            return Err(bad());
+        }
+        Ok(Zeroizing::new(doc.database_key.clone()))
+    }
+
+    /// Forget a device wallet's database key at either path, and its record. No password, as
+    /// `forget_phrase`: what it opened can no longer be read, and a wallet core starts over.
+    pub fn forget_device_wallet(&self, signer: &str, account: &str) -> Result<bool> {
+        let ids: Vec<String> = self
+            .device_records()?
+            .into_iter()
+            .filter(|(_, w)| w.signer == signer && w.account == account)
+            .map(|(id, _)| id)
+            .collect();
+        let mut forgotten = false;
+        for id in ids {
+            forgotten |= self.forget_device_id(&id)?;
+        }
+        Ok(forgotten)
+    }
+
+    fn forget_device_id(&self, id: &str) -> Result<bool> {
+        if !layout::is_device_id(id) {
+            return Err(KeystoreError::InvalidParams(format!("invalid device wallet id {id:?}")));
+        }
+        let removed = remove_path(&self.device_vault_path(id))?;
+        let staged = remove_path(&self.device_stage_dir(id))?;
+        let recorded =
+            self.update(&self.device_wallets_path(), |ws: &mut BTreeMap<String, DeviceWallet>| ws.remove(id).is_some())?;
+        Ok(removed || staged || recorded)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3140,6 +3318,77 @@ mod tests {
         .unwrap();
         assert_eq!(ks.bitcoin_start(&dated.id).unwrap(), ("restored".to_string(), None));
         assert!(ks.bitcoin_start("g_00000000000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn a_device_wallets_database_key_is_made_at_its_first_open_and_needs_its_password_after() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let (shell, acct) = ("keycard_shell_module", "shell-73c5da0a-84-1-0");
+        assert!(ks.device_wallets().unwrap().is_empty());
+
+        let first = ks.device_database_key(shell, acct, "data-pw", Some("2021-11-14")).unwrap();
+        assert!(first.created);
+        assert_eq!(first.database_key.len(), 64);
+        assert_eq!(first.birthday.as_deref(), Some("2021-11-14"));
+
+        // Later opens need the password it was made with, and keep the first birthday.
+        let again = ks.device_database_key(shell, acct, "data-pw", Some("2009-01-03")).unwrap();
+        assert!(!again.created);
+        assert_eq!(*again.database_key, *first.database_key);
+        assert_eq!(again.birthday.as_deref(), Some("2021-11-14"));
+        assert!(matches!(ks.device_database_key(shell, acct, "nope", None), Err(KeystoreError::Vault(_))));
+
+        // The same id from another module is another wallet.
+        let other = ks.device_database_key("keycard_module", acct, "x", None).unwrap();
+        assert!(other.created && *other.database_key != *first.database_key);
+        assert_eq!(ks.device_wallets().unwrap().len(), 2);
+
+        // The key is in the vault and nowhere in the record, and the scan explains both.
+        let record = std::fs::read_to_string(dir.path().join("device-wallets.json")).unwrap();
+        assert!(record.contains(acct) && !record.contains(first.database_key.as_str()), "{record}");
+        let scan = ks.scan().unwrap();
+        assert_eq!(scan.devices.len(), 2);
+        assert!(scan.stray().is_empty() && scan.possible_key_material().is_empty(), "{scan:?}");
+
+        // Forgetting it needs no password, and the next open makes a new key.
+        assert!(ks.forget_device_wallet(shell, acct).unwrap());
+        assert!(!ks.forget_device_wallet(shell, acct).unwrap());
+        let fresh = ks.device_database_key(shell, acct, "new-pw", None).unwrap();
+        assert!(fresh.created && *fresh.database_key != *first.database_key && fresh.birthday.is_none());
+    }
+
+    #[test]
+    fn a_device_wallet_open_refuses_what_it_could_not_keep() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let long = "a".repeat(129);
+        for (signer, account, pw, day) in [
+            ("", "acct", "pw", None),
+            ("keycard_shell_module", "", "pw", None),
+            ("keycard_shell_module", "acct", "", None),
+            ("keycard_shell_module", "acct", "pw", Some("2008-12-31")),
+            ("keycard_shell_module", long.as_str(), "pw", None),
+            ("keycard_shell_module", "acct\u{202e}", "pw", None),
+        ] {
+            let r = ks.device_database_key(signer, account, pw, day);
+            assert!(matches!(r, Err(KeystoreError::InvalidParams(_))), "{signer:?} {account:?}: {:?}", r.err().map(|e| e.to_string()));
+        }
+        assert!(ks.device_wallets().unwrap().is_empty() && !dir.path().join("device-wallets.json").exists());
+    }
+
+    #[test]
+    fn an_interrupted_first_open_starts_over() {
+        // A record whose vault never landed is no wallet: the next open makes its key afresh.
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let made = ks.device_database_key("keycard_module", "acct", "pw", None).unwrap();
+        let (id, _) = ks.device_wallets().unwrap().remove(0);
+        std::fs::remove_file(ks.device_vault_path(&id)).unwrap();
+        assert!(ks.device_wallets().unwrap().is_empty());
+        let again = ks.device_database_key("keycard_module", "acct", "other", None).unwrap();
+        assert!(again.created && *again.database_key != *made.database_key);
+        assert_eq!(ks.device_records().unwrap().len(), 1, "the stale record went with it");
     }
 
     #[test]

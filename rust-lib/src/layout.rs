@@ -31,6 +31,8 @@ pub enum Doc {
     /// Wallet names. Its own document rather than a field of `groups.json`, so a name is
     /// still readable for a group that document does not know about.
     GroupLabels,
+    /// Which device account each database-key vault belongs to.
+    DeviceWallets,
 }
 
 impl Doc {
@@ -40,10 +42,11 @@ impl Doc {
             Doc::Accounts => "accounts.json",
             Doc::Labels => "labels.json",
             Doc::GroupLabels => "group-labels.json",
+            Doc::DeviceWallets => "device-wallets.json",
         }
     }
 
-    pub const ALL: [Doc; 4] = [Doc::Groups, Doc::Accounts, Doc::Labels, Doc::GroupLabels];
+    pub const ALL: [Doc; 5] = [Doc::Groups, Doc::Accounts, Doc::Labels, Doc::GroupLabels, Doc::DeviceWallets];
 
     fn of_file(name: &str) -> Option<Doc> {
         Doc::ALL.into_iter().find(|d| d.file() == name)
@@ -59,6 +62,8 @@ pub enum StageKind {
     Group(String),
     /// `<ks>/groups/.stage-<phrase id>` — a kept recovery phrase.
     Phrase(String),
+    /// `<ks>/groups/.stage-<device id>` — a device wallet's database key.
+    Device(String),
     /// `<ks>/.stage-import-<nonce>` — scratch for a write we hand to a path-based library.
     Import(String),
 }
@@ -87,6 +92,9 @@ pub enum Slot {
     /// `<ks>/groups/<phrase id>.json` — a recovery phrase the person chose to keep, in its own
     /// scrypt vault. Whole-wallet material for every account the phrase makes.
     PhraseVault(String),
+    /// `<ks>/groups/<device id>.json` — the database key of a Bitcoin wallet whose key is on a
+    /// device, under a password the person set. It opens the wallet core's records, never a coin.
+    DeviceVault(String),
     Doc(Doc),
     Stage(StageKind),
     /// `<ks>/.lock` — cross-process exclusion for the bookkeeping read-modify-write.
@@ -101,10 +109,12 @@ impl Slot {
             Slot::GroupKey(id) => Path::new("groups").join(format!("{id}.json")),
             Slot::GroupDir => PathBuf::from("groups"),
             Slot::PhraseVault(id) => Path::new("groups").join(format!("{id}.json")),
+            Slot::DeviceVault(id) => Path::new("groups").join(format!("{id}.json")),
             Slot::Doc(d) => PathBuf::from(d.file()),
             Slot::Stage(StageKind::Vault(addr)) => PathBuf::from(format!("{STAGE_PREFIX}{addr}")),
             Slot::Stage(StageKind::Group(id)) => Path::new("groups").join(format!("{STAGE_PREFIX}{id}")),
             Slot::Stage(StageKind::Phrase(id)) => Path::new("groups").join(format!("{STAGE_PREFIX}{id}")),
+            Slot::Stage(StageKind::Device(id)) => Path::new("groups").join(format!("{STAGE_PREFIX}{id}")),
             Slot::Stage(StageKind::Import(n)) => PathBuf::from(format!("{STAGE_PREFIX}{IMPORT_INFIX}{n}")),
             Slot::Lock => PathBuf::from(".lock"),
         }
@@ -114,7 +124,7 @@ impl Slot {
     pub fn staged_name(kind: &StageKind) -> String {
         match kind {
             StageKind::Vault(addr) => format!("{addr}.json"),
-            StageKind::Group(id) | StageKind::Phrase(id) => format!("{id}.json"),
+            StageKind::Group(id) | StageKind::Phrase(id) | StageKind::Device(id) => format!("{id}.json"),
             StageKind::Import(_) => IMPORT_FILE.to_string(),
         }
     }
@@ -185,6 +195,11 @@ pub struct Scan {
     pub phrases: Vec<String>,
     /// Kept phrases an interrupted write left at `<ks>/groups/.stage-<phrase id>/<phrase id>.json`.
     pub staged_phrases: Vec<String>,
+    /// Device wallets' database keys at `<ks>/groups/<device id>.json`. Not key material: they
+    /// open a wallet core's records, and no coin.
+    pub devices: Vec<String>,
+    /// Database keys an interrupted write left at `<ks>/groups/.stage-<device id>/<device id>.json`.
+    pub staged_devices: Vec<String>,
     /// Documents a write did not finish publishing. Explained, so they are not treated as
     /// key material — but reported, so they are never silently dropped either.
     pub doc_stages: Vec<String>,
@@ -210,6 +225,8 @@ impl Scan {
             &mut self.staged,
             &mut self.phrases,
             &mut self.staged_phrases,
+            &mut self.devices,
+            &mut self.staged_devices,
             &mut self.doc_stages,
             &mut self.possible_keys,
             &mut self.unexplained,
@@ -257,6 +274,15 @@ impl Scan {
     pub fn phrase_ids(&self) -> Vec<String> {
         let mut out = self.phrases.clone();
         out.extend(self.staged_phrases.iter().cloned());
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Device wallet ids on disk, at either path. The set `forget_device_wallet` must be able to name.
+    pub fn device_ids(&self) -> Vec<String> {
+        let mut out = self.devices.clone();
+        out.extend(self.staged_devices.iter().cloned());
         out.sort();
         out.dedup();
         out
@@ -310,6 +336,9 @@ pub enum Entry {
     PhraseVault(String),
     StagedPhraseVault(String),
     PhraseStage(String),
+    DeviceVault(String),
+    StagedDeviceVault(String),
+    DeviceStage(String),
     ImportStage(String),
     ImportScratch(String),
     /// Not from any `Slot`. Treated as material until someone proves otherwise.
@@ -360,6 +389,11 @@ pub fn is_phrase_id(id: &str) -> bool {
     id.len() == 34 && id.starts_with("p_") && is_hex(&id[2..], 32)
 }
 
+/// A device wallet's database key: `d_` + 16 random bytes in hex, never derived from the account.
+pub fn is_device_id(id: &str) -> bool {
+    id.len() == 34 && id.starts_with("d_") && is_hex(&id[2..], 32)
+}
+
 /// A vault filename is the address as `vault_name` writes it: 40 lowercase hex, no `0x`.
 /// Anything else is unexplained rather than a vault — a name we could not have written
 /// does not name a file we can open.
@@ -375,6 +409,10 @@ fn phrase_stem(name: &str) -> Option<String> {
     name.strip_suffix(".json").filter(|s| is_phrase_id(s)).map(str::to_string)
 }
 
+fn device_stem(name: &str) -> Option<String> {
+    name.strip_suffix(".json").filter(|s| is_device_id(s)).map(str::to_string)
+}
+
 /// Which staging directory a NAME denotes. The three shapes are distinguishable from each
 /// other, so one parser serves and `classify` checks the position separately.
 fn stage_name(name: &str) -> Option<StageKind> {
@@ -387,6 +425,9 @@ fn stage_name(name: &str) -> Option<StageKind> {
     }
     if is_phrase_id(rest) {
         return Some(StageKind::Phrase(rest.into()));
+    }
+    if is_device_id(rest) {
+        return Some(StageKind::Device(rest.into()));
     }
     is_group_id(rest).then(|| StageKind::Group(rest.into()))
 }
@@ -490,9 +531,10 @@ pub fn classify(rel: &[String], kind: Kind) -> Entry {
                 Entry::StagedVault(a)
             }
             Some(StageKind::Import(n)) if at(1) == IMPORT_FILE => Entry::ImportScratch(n),
-            None if at(0) == "groups" => match (group_stem(at(1)), phrase_stem(at(1))) {
-                (Some(id), _) => Entry::GroupKey(id),
-                (_, Some(id)) => Entry::PhraseVault(id),
+            None if at(0) == "groups" => match (group_stem(at(1)), phrase_stem(at(1)), device_stem(at(1))) {
+                (Some(id), _, _) => Entry::GroupKey(id),
+                (_, Some(id), _) => Entry::PhraseVault(id),
+                (_, _, Some(id)) => Entry::DeviceVault(id),
                 _ => Entry::Unexplained,
             },
             _ => Entry::Unexplained,
@@ -500,6 +542,7 @@ pub fn classify(rel: &[String], kind: Kind) -> Entry {
         (2, Kind::Dir) => match (at(0), stage_name(at(1))) {
             ("groups", Some(StageKind::Group(id))) => Entry::GroupStage(id),
             ("groups", Some(StageKind::Phrase(id))) => Entry::PhraseStage(id),
+            ("groups", Some(StageKind::Device(id))) => Entry::DeviceStage(id),
             _ => Entry::Unexplained,
         },
         (3, Kind::File) if at(0) == "groups" => match stage_name(at(1)) {
@@ -508,6 +551,9 @@ pub fn classify(rel: &[String], kind: Kind) -> Entry {
             }
             Some(StageKind::Phrase(staged)) if phrase_stem(at(2)).as_deref() == Some(staged.as_str()) => {
                 Entry::StagedPhraseVault(staged)
+            }
+            Some(StageKind::Device(staged)) if device_stem(at(2)).as_deref() == Some(staged.as_str()) => {
+                Entry::StagedDeviceVault(staged)
             }
             _ => Entry::Unexplained,
         },
@@ -603,6 +649,8 @@ fn file(out: &mut Scan, rel: &[String], what: Entry, seen: Seen) {
         Entry::StagedGroupKey(id) => out.staged.push(id),
         Entry::PhraseVault(id) => out.phrases.push(id),
         Entry::StagedPhraseVault(id) => out.staged_phrases.push(id),
+        Entry::DeviceVault(id) => out.devices.push(id),
+        Entry::StagedDeviceVault(id) => out.staged_devices.push(id),
         Entry::DocStage => out.doc_stages.push(rel_str(rel)),
         // Explained and holding nothing of its own: the material inside is what gets filed.
         Entry::Doc(_)
@@ -610,6 +658,7 @@ fn file(out: &mut Scan, rel: &[String], what: Entry, seen: Seen) {
         | Entry::GroupDir
         | Entry::GroupStage(_)
         | Entry::PhraseStage(_)
+        | Entry::DeviceStage(_)
         | Entry::ImportScratch(_) => {}
         Entry::Unexplained => {
             let path = rel_str(rel);
@@ -698,6 +747,7 @@ mod tests {
     const A: &str = "f39fd6e51aad88f6f4ce6ab8827279cfffb92266";
     const G: &str = "g_0123456789abcdef0123456789abcdef";
     const P: &str = "p_0123456789abcdef0123456789abcdef";
+    const D: &str = "d_0123456789abcdef0123456789abcdef";
 
     fn parts(p: &Path) -> Vec<String> {
         p.components().map(|c| c.as_os_str().to_string_lossy().into_owned()).collect()
@@ -717,6 +767,7 @@ mod tests {
             (p("accounts.json"), Kind::File, Entry::Doc(Doc::Accounts)),
             (p("labels.json"), Kind::File, Entry::Doc(Doc::Labels)),
             (p("group-labels.json"), Kind::File, Entry::Doc(Doc::GroupLabels)),
+            (p("device-wallets.json"), Kind::File, Entry::Doc(Doc::DeviceWallets)),
             (p(".lock"), Kind::File, Entry::Lock),
             (p(&format!("{}x", crate::atomic::DOC_STAGE_PREFIX)), Kind::File, Entry::DocStage),
             (p("groups"), Kind::Dir, Entry::GroupDir),
@@ -728,6 +779,9 @@ mod tests {
             (p(&format!("groups/{P}.json")), Kind::File, Entry::PhraseVault(P.into())),
             (p(&format!("groups/.stage-{P}")), Kind::Dir, Entry::PhraseStage(P.into())),
             (p(&format!("groups/.stage-{P}/{P}.json")), Kind::File, Entry::StagedPhraseVault(P.into())),
+            (p(&format!("groups/{D}.json")), Kind::File, Entry::DeviceVault(D.into())),
+            (p(&format!("groups/.stage-{D}")), Kind::Dir, Entry::DeviceStage(D.into())),
+            (p(&format!("groups/.stage-{D}/{D}.json")), Kind::File, Entry::StagedDeviceVault(D.into())),
             (p(&format!(".stage-import-{n}")), Kind::Dir, Entry::ImportStage(n.clone())),
             (p(&format!(".stage-import-{n}/import.json")), Kind::File, Entry::ImportScratch(n)),
         ]
@@ -741,6 +795,8 @@ mod tests {
             (Slot::Vault(A.into()), Entry::Vault(A.into())),
             (Slot::GroupKey(G.into()), Entry::GroupKey(G.into())),
             (Slot::PhraseVault(P.into()), Entry::PhraseVault(P.into())),
+            (Slot::DeviceVault(D.into()), Entry::DeviceVault(D.into())),
+            (Slot::Doc(Doc::DeviceWallets), Entry::Doc(Doc::DeviceWallets)),
             (Slot::Doc(Doc::Groups), Entry::Doc(Doc::Groups)),
             (Slot::Doc(Doc::Accounts), Entry::Doc(Doc::Accounts)),
             (Slot::Doc(Doc::Labels), Entry::Doc(Doc::Labels)),
@@ -753,7 +809,13 @@ mod tests {
 
         // A stage is a DIRECTORY, and the file it comes to hold is a file. Both halves of
         // every stage kind round-trip, the import scratch included.
-        for kind in [StageKind::Vault(A.into()), StageKind::Group(G.into()), StageKind::Phrase(P.into()), StageKind::import()] {
+        for kind in [
+            StageKind::Vault(A.into()),
+            StageKind::Group(G.into()),
+            StageKind::Phrase(P.into()),
+            StageKind::Device(D.into()),
+            StageKind::import(),
+        ] {
             let dir = Slot::Stage(kind.clone()).rel();
             let inside = dir.join(Slot::staged_name(&kind));
             assert_ne!(classify(&parts(&dir), Kind::Dir), Entry::Unexplained, "{kind:?}");
@@ -805,6 +867,10 @@ mod tests {
             vec!["groups", ".stage-g_0123456789abcdef0123456789abcdef", "p_0123456789abcdef0123456789abcdef.json"],
             // A phrase vault anywhere but the key directory.
             vec!["p_0123456789abcdef0123456789abcdef.json"],
+            // A device stage holding a group key, and the reverse; a database key outside the key directory.
+            vec!["groups", ".stage-d_0123456789abcdef0123456789abcdef", "g_0123456789abcdef0123456789abcdef.json"],
+            vec!["groups", ".stage-g_0123456789abcdef0123456789abcdef", "d_0123456789abcdef0123456789abcdef.json"],
+            vec!["d_0123456789abcdef0123456789abcdef.json"],
             vec!["groups", "x", "y", "z"],
             // HOLE 2's own shapes: a directory at depth 2, and one where a key belongs.
             vec!["a", "b"],
@@ -855,6 +921,23 @@ mod tests {
         assert_eq!(s.possible_key_material(), vec![format!("groups/.stage-{P}/{P}.json"), format!("groups/{P}.json")]);
         assert_eq!(s.phrase_ids(), vec![P.to_string()]);
         assert!(s.key_ids().is_empty(), "a phrase is not a wallet's key, so nothing reads it as an orphan");
+    }
+
+    #[test]
+    fn a_device_database_key_is_explained_at_either_path_and_is_no_wallet_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = Root::new(dir.path().to_path_buf());
+        let groups = root.as_path().join("groups");
+        std::fs::create_dir_all(groups.join(format!(".stage-{D}"))).unwrap();
+        std::fs::write(groups.join(format!("{D}.json")), "{}").unwrap();
+        std::fs::write(groups.join(format!(".stage-{D}")).join(format!("{D}.json")), "{}").unwrap();
+        let s = scan(&root).unwrap();
+        assert_eq!((s.devices.clone(), s.staged_devices.clone()), (vec![D.to_string()], vec![D.to_string()]));
+        assert!(s.stray().is_empty(), "explained, so not stray: {s:?}");
+        // It opens a wallet core's records, never a coin, so nothing that mints reads it as a key.
+        assert!(s.possible_key_material().is_empty(), "{s:?}");
+        assert!(s.key_ids().is_empty() && s.phrase_ids().is_empty());
+        assert_eq!(s.device_ids(), vec![D.to_string()]);
     }
 
     #[test]

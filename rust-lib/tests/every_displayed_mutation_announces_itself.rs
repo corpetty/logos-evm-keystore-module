@@ -32,6 +32,8 @@ const ANNOUNCES: &[&str] = &[
     "settle",
     "import_bitcoin",
     "forget_phrase",
+    "device_database_key",
+    "forget_device_wallet",
 ];
 
 /// Methods that must stay silent: they persist nothing, or nothing a reader shows. Listed so
@@ -65,6 +67,7 @@ const SILENT: &[&str] = &[
     "lock",
     "unlocked",
     "database_key",
+    "device_wallets",
 ];
 
 /// The file with comments and string literals blanked, byte offsets preserved: brace and
