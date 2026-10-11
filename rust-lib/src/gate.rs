@@ -202,6 +202,8 @@ pub const TIER_D_METHODS: &[&str] = &[
     // key material, as `forget_derivation` does.
     "show_phrase",
     "forget_phrase",
+    // A device wallet's database key: forgetting it means its records must be rebuilt.
+    "forget_device_wallet",
 ];
 
 /// Tier D: a configured custodian, for a method the registry names.
@@ -212,7 +214,7 @@ pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bo
 /// The signer interface's signing calls and the keys an unlock holds — Tier M, the manager's.
 /// The manager enforces which apps an unlock covers; a module reaching these past it would not.
 pub const TIER_M_METHODS: &[&str] =
-    &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key"];
+    &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key", "device_database_key"];
 
 /// Tier M: a configured manager, for a method the registry names.
 pub fn tier_m_admits(method: &str, managers: &[String], caller: &Caller) -> bool {
