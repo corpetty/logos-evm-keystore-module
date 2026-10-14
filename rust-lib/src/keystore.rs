@@ -860,10 +860,20 @@ impl Storage {
     }
 }
 
+/// A local seed identity, shared by all of its coin/account branches. The check is salted by
+/// the random ID and derived from a public address; neither the seed nor a root key is retained.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeedLink {
+    pub id: String,
+    pub check: String,
+}
+
 /// A group's record in `groups.json`. Nothing here is a secret: `usedPassphrase` is a
 /// boolean so a user restoring elsewhere is told a passphrase was involved, never what it was.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Group {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<SeedLink>,
     pub storage: Storage,
     #[serde(rename = "pathPrefix")]
     pub path_prefix: String,
@@ -1684,6 +1694,86 @@ impl Keystore {
         Ok(Derived { address, path: path.to_string(), group: id.to_string(), index: path.index })
     }
 
+    fn seed_check(seed: &Seed, id: &str) -> Result<String> {
+        let key = seed.account_key(0)?;
+        let address = hd::signer_in_account(&key, 0, 0)?.address();
+        Ok(hex::encode(alloy::primitives::keccak256(
+            format!("logos-keystore-seed-v1:{id}:{address}").as_bytes(),
+        )))
+    }
+
+    /// Verify a legacy branch using its actual public derivation, never a short fingerprint.
+    fn seed_matches_group(&self, seed: &Seed, id: &str, group: &Group) -> Result<bool> {
+        if let Some(link) = &group.seed {
+            return Ok(Self::seed_check(seed, &link.id)? == link.check);
+        }
+        if let Some(family) = &group.family {
+            let family = Family::parse(family)?;
+            let chain = Chain::parse(group.chain.as_deref().unwrap_or(""))?;
+            let account = btc::parse_account_path(&group.path_prefix, family, chain)?;
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            let (key, _) = AccountSecret::from_seed(&secp, seed.as_secret(), family, chain, account)?;
+            return Ok(group.xpub.as_deref() == Some(key.xpub(&secp).to_string().as_str()));
+        }
+        let account = Bip44Path::parse_account_prefix(&group.path_prefix)?;
+        let key = seed.account_key(account)?;
+        for (address, origin) in self.get_provenance()? {
+            if origin.group == id {
+                let path = Bip44Path::parse(&origin.path)?;
+                if path.account != account {
+                    continue;
+                }
+                let derived = hd::signer_in_account(&key, path.change, path.index)?.address();
+                if parse_address(&address).ok() == Some(derived) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// When adding a branch from the UI, refuse a different phrase/passphrase before any write.
+    pub fn check_seed_source(&self, phrase: &str, passphrase: &str, group: &str) -> Result<()> {
+        let groups = self.get_groups()?;
+        let record = groups.get(group).ok_or_else(|| KeystoreError::NotFound("source wallet".into()))?;
+        let seed = Seed::from_mnemonic(phrase, passphrase)?;
+        if !self.seed_matches_group(&seed, group, record)? {
+            return Err(KeystoreError::Refused(
+                "the recovery phrase and BIP39 passphrase do not match this seed group".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn seed_link(&self, seed: &Seed) -> Result<(SeedLink, BTreeMap<String, Option<SeedLink>>)> {
+        let groups = self.get_groups()?;
+        let mut matching = Vec::new();
+        let mut link = None;
+        for (id, group) in &groups {
+            if self.seed_matches_group(seed, id, group).unwrap_or(false) {
+                matching.push(id.clone());
+                if link.is_none() {
+                    link = group.seed.clone();
+                }
+            }
+        }
+        let link = match link {
+            Some(link) => link,
+            None => {
+                let id = new_group_id();
+                SeedLink { check: Self::seed_check(seed, &id)?, id }
+            }
+        };
+        let prior = matching
+            .into_iter()
+            .map(|id| {
+                let old = groups[&id].seed.clone();
+                (id, old)
+            })
+            .collect();
+        Ok((link, prior))
+    }
+
     /// Import a mnemonic, optionally keeping the account key so later accounts can be
     /// derived without the phrase. Creates the group.
     pub fn import_mnemonic_ex(&self, req: &ImportRequest) -> Result<Derived> {
@@ -1695,15 +1785,17 @@ impl Keystore {
         }
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
+        let (seed_link, prior_seeds) = self.seed_link(&seed)?;
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
         let record = Group {
-                storage: req.storage,
-                path_prefix: Bip44Path::account_prefix(path.account),
-                next_index: 0,
-                retired: Vec::new(),
-                used_passphrase: !req.bip39_passphrase.is_empty(),
+            seed: Some(seed_link.clone()),
+            storage: req.storage,
+            path_prefix: Bip44Path::account_prefix(path.account),
+            next_index: 0,
+            retired: Vec::new(),
+            used_passphrase: !req.bip39_passphrase.is_empty(),
             // The name lives in its own document; this field is only what older builds wrote.
             label: String::new(),
             created_ms: now_ms(),
@@ -1716,6 +1808,11 @@ impl Keystore {
             birthday: None,
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            for old in prior_seeds.keys() {
+                if let Some(group) = groups.get_mut(old) {
+                    group.seed = Some(seed_link.clone());
+                }
+            }
             groups.insert(id.clone(), record)
         })
         .inspect_err(|_| self.forget_new_phrase(made, &phrase))?;
@@ -1739,6 +1836,11 @@ impl Keystore {
             let _ = remove_path(&self.stage_dir(&id));
             let _ = self.write_group_label(&id, "");
             let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+                for (old, seed) in &prior_seeds {
+                    if let Some(group) = groups.get_mut(old) {
+                        group.seed = seed.clone();
+                    }
+                }
                 groups.remove(&id)
             });
             self.forget_new_phrase(made, &phrase);
@@ -1810,6 +1912,46 @@ impl Keystore {
             return Err(KeystoreError::Refused(format!("{path} is already held, as {address}")));
         }
         self.persist_derived(&key, &id, path, password)
+    }
+
+    /// Preview a recovery source without persisting it. Ethereum rows are addresses;
+    /// Bitcoin rows are accounts, each previewing its first receive address.
+    pub fn preview_mnemonic(&self, phrase: &str, passphrase: &str, family: &str,
+                            chain: &str, account: u32, from: u32, count: u32)
+        -> Result<Vec<serde_json::Value>> {
+        if count == 0 || count > MAX_PREVIEW || from.checked_add(count).is_none_or(|n| n > 0x8000_0000) {
+            return Err(KeystoreError::InvalidParams("invalid preview range".into()));
+        }
+        let seed = Seed::from_mnemonic(phrase, passphrase)?;
+        let held = self.held_addresses()?;
+        let groups = self.get_groups()?;
+        let mut out = Vec::new();
+        if family == "evm" {
+            let key = seed.account_key(account)?;
+            for index in from..from + count {
+                let path = Bip44Path::new(account, 0, index)?;
+                let address = hd::address_in_account(&key, 0, index)?;
+                out.push(serde_json::json!({"family": family, "chain": "main", "account": account,
+                    "index": index, "path": path.to_string(), "address": address.to_string(),
+                    "present": held.contains(&vault_name(&address))}));
+            }
+        } else {
+            let family = Family::parse(family)?;
+            let chain = Chain::parse(chain)?;
+            let secp = bitcoin::secp256k1::Secp256k1::new();
+            for index in from..from + count {
+                let (key, fingerprint) = AccountSecret::from_seed(&secp, seed.as_secret(), family, chain, index)?;
+                let public = btc::AccountPublic { family, chain, account: index, fingerprint, xpub: key.xpub(&secp) };
+                let address = bitcoin::Address::from_script(&public.script_at(&secp, 0, 0)?, chain.network(if chain == Chain::Main { "main" } else { "testnet" })?)
+                    .map_err(|e| KeystoreError::InvalidParams(e.to_string()))?;
+                let path = format!("m/{}", public.origin().to_string().trim_start_matches("m/"));
+                let present = groups.values().any(|g| g.family.as_deref() == Some(family.as_str())
+                    && g.chain.as_deref() == Some(chain.as_str()) && g.xpub.as_deref() == Some(public.xpub.to_string().as_str()));
+                out.push(serde_json::json!({"family": family.as_str(), "chain": chain.as_str(),
+                    "account": index, "index": index, "path": path, "address": address.to_string(), "present": present}));
+            }
+        }
+        Ok(out)
     }
 
     /// Addresses only — no keys, no vaults written, and no network. Whether any of them has
@@ -1999,6 +2141,7 @@ impl Keystore {
             out.push(GroupView {
                 id,
                 group: Group {
+                    seed: None,
                     storage: Storage::Extkey,
                     path_prefix: String::new(),
                     next_index: 0,
@@ -2066,6 +2209,28 @@ impl Keystore {
                 ))
             })
             .collect())
+    }
+
+    /// Public source metadata only. A seed link is a verified local grouping, never words.
+    pub fn account_origins(&self) -> Result<BTreeMap<String, serde_json::Value>> {
+        let groups = self.get_groups()?;
+        let labels = self.get_group_labels()?;
+        Ok(self.provenance_view()?.into_iter().map(|a| {
+            let p = a.provenance;
+            let group = groups.get(&p.group);
+            let phrase = group.map(|g| {
+                let id = g.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(&p.group);
+                // One deterministic name across the wallets linked to this seed.
+                let name = groups.iter().filter(|(gid, other)| {
+                    other.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(gid) == id
+                }).find_map(|(gid, _)| labels.get(gid).filter(|s| !s.trim().is_empty()));
+                serde_json::json!({ "id": id, "name": name })
+            });
+            (a.address.to_string(), serde_json::json!({
+                "devices": [{ "id": "local", "kind": "keystore", "name": "" }],
+                "phrase": phrase, "kind": p.origin, "path": p.path
+            }))
+        }).collect())
     }
 
     /// Retire an index so it is never handed out again. A reused path may collide with an
@@ -2176,6 +2341,7 @@ impl Keystore {
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let (secret, fingerprint) =
             AccountSecret::from_seed(&secp, seed.as_secret(), req.family, req.chain, req.account)?;
+        let (seed_link, prior_seeds) = self.seed_link(&seed)?;
         drop(seed);
         let account = AccountPublic {
             family: req.family,
@@ -2192,7 +2358,8 @@ impl Keystore {
             account_key: secret.encode().to_string(),
             database_key: hex::encode(&db_key[..]),
         };
-        let text = Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
+        let text =
+            Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
         drop(vault);
 
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
@@ -2205,6 +2372,7 @@ impl Keystore {
             WalletStart::Restored(day) => ("restored", day.map(str::to_string)),
         };
         let record = Group {
+            seed: Some(seed_link.clone()),
             storage: Storage::Extkey,
             path_prefix: format!("m/{}'/{}'/{}'", req.family.purpose(), req.chain.coin_type(), req.account),
             next_index: 0,
@@ -2221,6 +2389,11 @@ impl Keystore {
             birthday,
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            for old in prior_seeds.keys() {
+                if let Some(group) = groups.get_mut(old) {
+                    group.seed = Some(seed_link.clone());
+                }
+            }
             groups.insert(id.clone(), record)
         })
         .inspect_err(|_| forget_new_phrase())?;
@@ -2232,7 +2405,14 @@ impl Keystore {
             let _ = remove_path(&self.group_vault_path(&id));
             let _ = remove_path(&self.stage_dir(&id));
             let _ = self.write_group_label(&id, "");
-            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| groups.remove(&id));
+            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+                for (old, seed) in &prior_seeds {
+                    if let Some(group) = groups.get_mut(old) {
+                        group.seed = seed.clone();
+                    }
+                }
+                groups.remove(&id)
+            });
             forget_new_phrase();
         })?;
         Ok(BitcoinGroup { id, account })
@@ -2266,6 +2446,19 @@ impl Keystore {
             .filter(|l| !l.trim().is_empty() && check_displayable(l, "label").is_ok())
             .map_or_else(|| id.to_string(), |l| format!("\"{}\"", l.trim()));
         Ok((AccountPublic { family, chain, account, fingerprint, xpub }, name))
+    }
+
+    /// First receiving address, derived from the saved public account key without opening a vault.
+    pub fn bitcoin_address_preview(&self, id: &str) -> Result<(String, String)> {
+        let (account, _) = self.bitcoin_account(id)?;
+        let script = account.script_at(&bitcoin::secp256k1::Secp256k1::verification_only(), 0, 0)?;
+        let network = match account.chain {
+            Chain::Main => bitcoin::Network::Bitcoin,
+            Chain::Test => bitcoin::Network::Testnet,
+        };
+        let address = bitcoin::Address::from_script(&script, network)
+            .map_err(|e| KeystoreError::InvalidParams(e.to_string()))?;
+        Ok((address.to_string(), format!("m/{}/0/0", account.origin().to_string().trim_start_matches("m/"))))
     }
 
     /// How a Bitcoin wallet came to be, and its birthday if known. A record from before either was
@@ -2653,6 +2846,46 @@ mod tests {
     const TEST_MNEMONIC: &str = "test test test test test test test test test test test junk";
     const ACCT0: Address = address!("f39Fd6e51aad88F6F4ce6aB8827279cffFb92266");
     const ACCT0_PK: &str = "ac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80";
+
+    #[test]
+    fn recovery_preview_matches_standard_vectors_and_writes_no_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let rows = ks.preview_mnemonic(TEST_MNEMONIC, "", "evm", "main", 0, 0, 5).unwrap();
+        assert_eq!(rows[0]["address"], ACCT0.to_string());
+        assert_eq!(rows[1]["address"], ACCT1.to_string());
+        assert_eq!(rows[4]["path"], "m/44'/60'/0'/0/4");
+        let next = ks.preview_mnemonic(TEST_MNEMONIC, "", "evm", "main", 0, 5, 5).unwrap();
+        assert_eq!(next[0]["path"], "m/44'/60'/0'/0/5");
+        let bip39 = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let btc = ks.preview_mnemonic(bip39, "", "bitcoin", "main", 0, 0, 2).unwrap();
+        assert_eq!(btc[0]["address"], "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu");
+        assert_eq!(btc[1]["path"], "m/84'/0'/1'");
+        let tap = ks.preview_mnemonic(bip39, "", "bitcoin_taproot", "main", 0, 0, 1).unwrap();
+        assert_eq!(tap[0]["address"], "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr");
+        assert!(ks.get_groups().unwrap().is_empty());
+        assert!(ks.list_accounts().unwrap().is_empty());
+        assert!(ks.kept_phrases().unwrap().is_empty());
+        assert!(ks.preview_mnemonic(TEST_MNEMONIC, "", "evm", "main", 0, HARDENED_INDEX - 2, 5).is_err());
+        assert!(ks.preview_mnemonic(TEST_MNEMONIC, "", "evm", "main", 0, 0, MAX_PREVIEW + 1).is_err());
+    }
+
+    #[test]
+    fn recovery_preview_marks_saved_accounts_and_passphrase_changes_addresses() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let imported = ks.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        let before = ks.export_keystore_json(&imported.address.to_string(), "pw").unwrap();
+        let rows = ks.preview_mnemonic(TEST_MNEMONIC, "", "evm", "main", 0, 0, 2).unwrap();
+        assert_eq!(rows[0]["present"], true);
+        assert_eq!(rows[1]["present"], false);
+        let other = ks.preview_mnemonic(TEST_MNEMONIC, "different", "evm", "main", 0, 0, 1).unwrap();
+        assert_ne!(other[0]["address"], rows[0]["address"]);
+        assert_eq!(before, ks.export_keystore_json(&imported.address.to_string(), "pw").unwrap());
+        let file: serde_json::Value = serde_json::from_str(&before).unwrap();
+        assert_eq!(file["version"], 3);
+        assert!(ks.list_derivation_keys().unwrap().is_empty());
+    }
 
     // ---- hardening regressions -------------------------------------------
     // One test per defect fixed in this pass. Each asserts the DANGEROUS
@@ -3246,6 +3479,34 @@ mod tests {
     }
 
     #[test]
+    fn bitcoin_address_previews_use_only_public_records_and_match_published_vectors() {
+        let phrase = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        for (family, expected) in [
+            (Family::Segwit, "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
+            (Family::Taproot, "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"),
+        ] {
+            for chain in [Chain::Main, Chain::Test] {
+                let dir = tempfile::tempdir().unwrap();
+                let ks = Keystore::new(dir.path());
+                let group = ks.import_bitcoin(&BitcoinImport {
+                    phrase, bip39_passphrase: "", family, chain, account: 0,
+                    password: "pw", label: "Savings", keep: KeepPhrase::No,
+                    start: WalletStart::Restored(None),
+                }).unwrap();
+                // A public-only copy has neither encrypted keys nor a recovery phrase.
+                let public_dir = tempfile::tempdir().unwrap();
+                std::fs::copy(dir.path().join("groups.json"), public_dir.path().join("groups.json")).unwrap();
+                let public = Keystore::new(public_dir.path());
+                let (address, path) = public.bitcoin_address_preview(&group.id).unwrap();
+                assert_eq!(path, format!("m/{}'/{}'/0'/0/0", family.purpose(), chain.coin_type()));
+                if chain == Chain::Main { assert_eq!(address, expected); }
+                else { assert!(address.starts_with("tb1")); }
+                assert!(public.bitcoin_address_preview("missing").is_err());
+            }
+        }
+    }
+
+    #[test]
     fn a_bitcoin_wallet_keeps_its_key_in_its_vault_and_its_public_half_in_its_record() {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
@@ -3437,6 +3698,59 @@ mod tests {
         let scan = ks.scan().unwrap();
         assert!(scan.possible_key_material().iter().any(|m| m.contains(&id)), "{scan:?}");
         assert!(scan.stray().is_empty(), "{scan:?}");
+    }
+
+    #[test]
+    fn seed_groups_join_chains_without_retaining_the_phrase_and_migrate_legacy_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let evm = ks.import_mnemonic_ex(&req(Storage::Plain, 0)).unwrap();
+        // Model an older record which predates seed grouping.
+        ks.update(&ks.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            groups.get_mut(&evm.group).unwrap().seed = None;
+        })
+        .unwrap();
+        ks.check_seed_source(TEST_MNEMONIC, "", &evm.group).unwrap();
+        assert!(ks
+            .check_seed_source(TEST_MNEMONIC, "different", &evm.group)
+            .is_err());
+        let btc = bitcoin_import(&ks, Family::Segwit);
+        let groups = ks.get_groups().unwrap();
+        assert_eq!(groups[&evm.group].seed, groups[&btc.id].seed);
+        assert!(groups[&evm.group].seed.is_some());
+        assert!(ks.kept_phrases().unwrap().is_empty());
+        let reopened = Keystore::new(dir.path());
+        assert_eq!(
+            reopened.get_groups().unwrap()[&btc.id].seed,
+            groups[&btc.id].seed
+        );
+        // The same words with a different BIP39 passphrase are a different seed.
+        let other =
+            bitcoin_import_keeping(&ks, TEST_MNEMONIC, "different", KeepPhrase::No).unwrap();
+        let groups = ks.get_groups().unwrap();
+        assert_ne!(groups[&other.id].seed, groups[&btc.id].seed);
+        assert!(ks
+            .check_seed_source(TEST_MNEMONIC, "different", &btc.id)
+            .is_err());
+        // Public grouping metadata contains neither recovery words nor BIP39 passphrases.
+        let json = std::fs::read_to_string(ks.groups_path()).unwrap();
+        assert!(!json.contains(TEST_MNEMONIC) && !json.contains("different"));
+    }
+
+    #[test]
+    fn failed_import_rolls_back_legacy_seed_associations() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let first = bitcoin_import(&ks, Family::Segwit);
+        ks.update(&ks.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            groups.get_mut(&first.id).unwrap().seed = None;
+        })
+        .unwrap();
+        std::fs::write(ks.accounts_path(), "not json").unwrap();
+        assert!(ks.import_mnemonic_ex(&req(Storage::Plain, 0)).is_err());
+        let groups = ks.get_groups().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert!(groups[&first.id].seed.is_none());
     }
 
     #[test]
@@ -3813,8 +4127,14 @@ mod tests {
         );
         assert!(!wallets.contains_key(&ungrouped.to_string()));
 
+        let origins = ks.account_origins().unwrap();
+        assert_eq!(origins[&ACCT0.to_string()]["phrase"], origins[&next.address.to_string()]["phrase"]);
+        assert_eq!(origins[&ACCT0.to_string()]["phrase"]["name"], "Main");
+        assert!(origins[&ungrouped.to_string()]["phrase"].is_null());
+        assert_eq!(origins[&ungrouped.to_string()]["kind"], "random");
         ks.set_group_label(&rename(&group, "")).unwrap();
         assert!(ks.account_wallets().unwrap().is_empty());
+        assert!(ks.account_origins().unwrap()[&ACCT0.to_string()]["phrase"]["id"].is_string());
     }
 
     #[test]

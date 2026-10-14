@@ -47,6 +47,9 @@ pub trait KeystoreModule: Send + 'static {
     /// hardened BIP-44 account level. `storage` defaults to `"plain"` — keeping nothing —
     /// so the pre-HD call shape behaves exactly as it did.
     fn import_mnemonic(&mut self, params_json: String) -> String;
+
+    /// Add a wallet only after verifying its phrase belongs to sourceGroup.
+    fn import_seed_wallet(&mut self, params_json: String) -> String;
     /// Add the next account of a derivation group, without the phrase. params JSON:
     /// `{ group?, groupPassword, password, change? }` → `{ ok, address, path, group,
     /// index, origin }`. `group` may be omitted only when exactly one group can derive.
@@ -58,6 +61,9 @@ pub trait KeystoreModule: Send + 'static {
     /// params JSON: `{ group, groupPassword, change?, from?, count? }` →
     /// `{ ok, group, addresses: [{ index, path, address, present }] }`.
     fn preview_addresses(&mut self, params_json: String) -> String;
+    /// Read-only recovery-source preview: phrase or keptPhrase + phrasePassword,
+    /// passphrase?, sourceGroup?, family, chain, account?, from?, count?. Tier D.
+    fn preview_mnemonic(&mut self, params_json: String) -> String;
     /// The ONE way to obtain a random key — a key no recovery phrase covers. params JSON:
     /// `{ password, acknowledgeUnrecoverable }`; the refusal says what an unrelated account
     /// IS rather than that a flag is missing.
@@ -386,6 +392,8 @@ impl KeystoreModuleImpl {
 
 #[derive(Deserialize)]
 struct ImportMnemonicParams {
+    #[serde(default, rename = "sourceGroup")]
+    source_group: Option<String>,
     #[serde(default)]
     phrase: String,
     #[serde(default)]
@@ -519,6 +527,8 @@ struct DeviceWalletParams {
 
 #[derive(Deserialize)]
 struct ImportBitcoinParams {
+    #[serde(default, rename = "sourceGroup")]
+    source_group: Option<String>,
     #[serde(default)]
     phrase: String,
     #[serde(default)]
@@ -605,6 +615,33 @@ impl KeystoreModule for KeystoreModuleImpl {
         }
     }
 
+    fn import_seed_wallet(&mut self, params_json: String) -> String {
+        let mut params = Zeroizing::new(params_json);
+        if !self.may_mutate("import_seed_wallet") {
+            return not_authorized();
+        }
+        #[derive(Deserialize)]
+        struct Target {
+            #[serde(rename = "sourceGroup")]
+            source_group: String,
+            family: String,
+        }
+        let target: Target = match serde_json::from_str(&params) {
+            Ok(p) => p,
+            Err(_) => return err("sourceGroup and family are required"),
+        };
+        if target.source_group.is_empty() {
+            return err("sourceGroup is required");
+        }
+        // The import methods verify the source before any writes and announce on success.
+        // A distinct API ensures an older backend cannot silently ignore sourceGroup.
+        match target.family.as_str() {
+            "evm" => self.import_mnemonic(std::mem::take(&mut *params)),
+            "bitcoin" | "bitcoin_taproot" => self.import_bitcoin(std::mem::take(&mut *params)),
+            _ => err("unsupported wallet family"),
+        }
+    }
+
     fn import_mnemonic(&mut self, params_json: String) -> String {
         if !self.may_mutate("import_mnemonic") {
             // Scrub before returning: the phrase and the password are both in this buffer,
@@ -631,11 +668,21 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(ks) => ks,
             Err(e) => return err(e),
         };
-        let (phrase, keep) =
-            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
-                Ok(v) => v,
-                Err(e) => return err(e),
-            };
+        let (phrase, keep) = match words_and_keep(
+            ks,
+            typed,
+            p.kept_phrase.as_deref(),
+            keep_password.as_deref(),
+            &phrase_password,
+        ) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        if let Some(source) = &p.source_group {
+            if let Err(e) = ks.check_seed_source(&phrase, &passphrase, source) {
+                return err(e);
+            }
+        }
         let res = ks.import_mnemonic_ex(&ImportRequest {
             phrase: &phrase,
             bip39_passphrase: &passphrase,
@@ -650,7 +697,8 @@ impl KeystoreModule for KeystoreModuleImpl {
         });
         match res {
             Ok(d) => {
-                let kept = ks.get_groups().ok().and_then(|gs| gs.get(&d.group).and_then(|r| r.phrase.clone()));
+                let kept =
+                    ks.get_groups().ok().and_then(|gs| gs.get(&d.group).and_then(|r| r.phrase.clone()));
                 self.announce();
                 json!({ "ok": true, "address": d.address.to_string(), "path": d.path,
                         "group": d.group, "storage": storage.as_str(), "index": d.index,
@@ -711,6 +759,39 @@ impl KeystoreModule for KeystoreModuleImpl {
                 self.announce();
                 derived_reply(&d)
             }
+            Err(e) => err(e),
+        }
+    }
+
+    fn preview_mnemonic(&mut self, params_json: String) -> String {
+        let params = Zeroizing::new(params_json);
+        if !self.may_mutate("preview_mnemonic") { return not_authorized(); }
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Preview {
+            #[serde(default)] phrase: String,
+            #[serde(default)] passphrase: String,
+            #[serde(default)] kept_phrase: Option<String>,
+            #[serde(default)] phrase_password: String,
+            #[serde(default)] source_group: Option<String>,
+            family: String, chain: String,
+            #[serde(default)] account: u32,
+            #[serde(default)] from: u32,
+            count: u32,
+        }
+        let p: Preview = match serde_json::from_str(&params) { Ok(p) => p, Err(_) => return err("invalid preview parameters") };
+        let typed = Zeroizing::new(p.phrase);
+        let passphrase = Zeroizing::new(p.passphrase);
+        let password = Zeroizing::new(p.phrase_password);
+        let ks = match self.ks() { Ok(ks) => ks, Err(e) => return err(e) };
+        let (words, _) = match words_and_keep(ks, typed, p.kept_phrase.as_deref(), None, &password) {
+            Ok(v) => v, Err(e) => return err(e),
+        };
+        if let Some(group) = p.source_group {
+            if let Err(e) = ks.check_seed_source(&words, &passphrase, &group) { return err(e); }
+        }
+        match ks.preview_mnemonic(&words, &passphrase, &p.family, &p.chain, p.account, p.from, p.count) {
+            Ok(addresses) => json!({"ok": true, "addresses": addresses}).to_string(),
             Err(e) => err(e),
         }
     }
@@ -828,15 +909,22 @@ impl KeystoreModule for KeystoreModuleImpl {
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
+                        let preview = if g.group.family.is_some() {
+                            match self.ks().and_then(|ks| ks.bitcoin_address_preview(&g.id).map_err(|e| e.to_string())) {
+                                Ok((address, path)) => json!({ "address": address, "path": path, "firstReceiving": true }),
+                                Err(error) => json!({ "error": error }),
+                            }
+                        } else { serde_json::Value::Null };
                         json!({
                             "id": g.id, "storage": g.group.storage.as_str(),
-                            "pathPrefix": g.group.path_prefix, "nextIndex": g.group.next_index,
+                            "pathPrefix": g.group.path_prefix,
+                            "seedId": g.group.seed.as_ref().map(|s| &s.id), "nextIndex": g.group.next_index,
                             "usedIndices": g.used_indices, "retiredIndices": g.group.retired,
                             "usedPassphrase": g.group.used_passphrase, "label": g.group.label,
                             "accountCount": g.account_count, "derivable": g.derivable,
                             "stranded": g.stranded, "staged": g.staged,
                             "family": g.group.family, "chain": g.group.chain,
-                            "phrase": g.group.phrase,
+                            "phrase": g.group.phrase, "preview": preview,
                         })
                     })
                     .collect();
@@ -1251,10 +1339,23 @@ impl KeystoreModule for KeystoreModuleImpl {
         if !self.reads_signer_state() {
             return not_authorized();
         }
-        match self.signer() {
+        let raw = match self.signer() {
             Ok(mut s) => signer_json::signer_accounts(&mut s),
-            Err(e) => err(e),
+            Err(e) => return err(e),
+        };
+        let mut reply: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v, Err(_) => return raw,
+        };
+        if let Ok(origins) = self.ks().and_then(|ks| ks.account_origins().map_err(|e| e.to_string())) {
+            if let Some(rows) = reply["accounts"].as_array_mut() {
+                for row in rows {
+                    if let Some(origin) = row["address"].as_str().and_then(|a| {
+                        origins.iter().find(|(key, _)| key.eq_ignore_ascii_case(a)).map(|(_, v)| v)
+                    }) { row["origin"] = origin.clone(); }
+                }
+            }
         }
+        reply.to_string()
     }
 
     fn sign(&mut self, request_json: String) -> String {
@@ -1459,7 +1560,9 @@ impl KeystoreModule for KeystoreModuleImpl {
         let birthday = p.birthday.as_deref().map(str::trim).filter(|b| !b.is_empty());
         let start = match (p.origin.as_deref().map(str::trim), birthday) {
             (Some("created"), None) => WalletStart::Created,
-            (Some("created"), Some(_)) => return err("a created wallet's birthday is the day it is made; send none"),
+            (Some("created"), Some(_)) => {
+                return err("a created wallet's birthday is the day it is made; send none")
+            }
             (None | Some("restored"), day) => WalletStart::Restored(day),
             (Some(other), _) => return err(format!("origin must be created or restored, not {other:?}")),
         };
@@ -1467,11 +1570,21 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(ks) => ks,
             Err(e) => return err(e),
         };
-        let (phrase, keep) =
-            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
-                Ok(v) => v,
-                Err(e) => return err(e),
-            };
+        let (phrase, keep) = match words_and_keep(
+            ks,
+            typed,
+            p.kept_phrase.as_deref(),
+            keep_password.as_deref(),
+            &phrase_password,
+        ) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        if let Some(source) = &p.source_group {
+            if let Err(e) = ks.check_seed_source(&phrase, &passphrase, source) {
+                return err(e);
+            }
+        }
         let req = BitcoinImport {
             phrase: &phrase,
             bip39_passphrase: &passphrase,

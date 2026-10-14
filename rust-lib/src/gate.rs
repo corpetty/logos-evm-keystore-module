@@ -170,6 +170,7 @@ pub fn holds_any_role(role_holders: &[String], caller: &Caller) -> bool {
 pub const TIER_D_METHODS: &[&str] = &[
     "create_mnemonic",
     "import_mnemonic",
+    "import_seed_wallet",
     "import_private_key",
     "import_keystore_json",
     "export_keystore_json",
@@ -185,6 +186,7 @@ pub const TIER_D_METHODS: &[&str] = &[
     "derive_next_account",
     "derive_account_at",
     "preview_addresses",
+    "preview_mnemonic",
     // The ONE way to obtain a random key. `new_account` used to be another, and sometimes
     // minted one silently; it is gone, so this name has to stay here.
     "create_unrelated_account",
@@ -312,10 +314,12 @@ mod tests {
             "derive_next_account",
             "derive_account_at",
             "preview_addresses",
+            "preview_mnemonic",
             "create_unrelated_account",
             "forget_derivation",
             "remove_group",
             "import_mnemonic",
+            "import_seed_wallet",
             "settle",
             "remove_unexplained",
             "set_label",
