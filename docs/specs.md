@@ -784,6 +784,18 @@ already held is refused rather than overwriting the vault.
 
 ---
 
+### `preview_mnemonic(params_json: String) -> String`
+
+Tier D, read-only. Accepts `phrase` or `keptPhrase` plus `phrasePassword`, optional
+`passphrase` and `sourceGroup`, and `family`, `chain`, `account`, `from`, `count`.
+A named source group must match the recovered seed before any addresses are returned.
+Counts are bounded by `MAX_PREVIEW`; ranges cannot enter hardened child indices.
+Returns `{ ok, addresses: [{ family, chain, account, index, path, address, present }] }`.
+Ethereum rows advance the address index at `m/44'/60'/account'/0/index`. Bitcoin rows
+advance the hardened account index and show the first receiving address, preserving the
+account's receive/change semantics. Preview writes no vaults or metadata and uses no network.
+It opens a kept phrase only inside the backend; the words are not returned to the UI.
+
 ### `preview_addresses(params_json: String) -> String`
 
 What a group would derive — **addresses only**. No keys, no vaults written, no

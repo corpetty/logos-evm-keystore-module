@@ -18,6 +18,19 @@
       # only ever belongs in `packages`.
       targets = systems ++ [ "x86_64-windows" ];
       forAllTargets = f: nixpkgs.lib.genAttrs targets f;
+      unitTests = pkgs: pkgs.rustPlatform.buildRustPackage {
+        pname = "keystore-unit-tests";
+        version = "1.0.0";
+        src = pkgs.runCommand "keystore-test-src" { } ''
+          mkdir -p $out
+          cp -r ${./rust-lib} $out/rust-lib
+          cp -r ${logos-module-builder.packages.${pkgs.stdenv.hostPlatform.system}.rust-sdk-src} $out/logos-rust-sdk-src
+        '';
+        sourceRoot = "keystore-test-src/rust-lib";
+        cargoLock = { lockFile = ./rust-lib/Cargo.lock; allowBuiltinFetchGit = true; };
+        buildNoDefaultFeatures = true;
+        doCheck = true;
+      };
     in
     {
       packages = forAllTargets (system:
@@ -25,6 +38,9 @@
           src = ./.;
           configFile = ./metadata.json;
           flakeInputs = inputs;
-        }).packages.${system});
+        }).packages.${system} // nixpkgs.lib.optionalAttrs (builtins.elem system systems) {
+          unit-tests = unitTests (import nixpkgs { inherit system; });
+        });
+      checks = forAllSystems (system: { unit-tests = self.packages.${system}.unit-tests; });
     };
 }

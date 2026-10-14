@@ -44,7 +44,7 @@ silently on a keystore that looked empty, and whether that was safe rested on a 
 scan being complete — which is not decidable by inspection.
 
 **HD derivation (Tier D):** `derive_next_account`, `derive_account_at`,
-`preview_addresses`, `forget_derivation`, `remove_group`.
+`preview_addresses`, `preview_mnemonic`, `forget_derivation`, `remove_group`.
 
 **Reads (ungated):** `list_accounts`, `has_address`, `get_labels`, `get_group_labels`,
 `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`,
@@ -163,3 +163,27 @@ nix build .#lgx
 The crypto core is feature-gated away from the Logos glue so it stays
 `cargo test`-able on its own; the builder compiles the glue via the default
 `logos_module` feature. See the wallet plan for the full architecture.
+
+### Recovery seed groups
+
+`list_groups` includes a local `seedId` for wallets derived from the same BIP39 seed.
+Ethereum, Bitcoin native SegWit and Bitcoin Taproot branches share this ID, including
+branches on different networks. A different BIP39 passphrase creates a different seed group.
+The existing wallet IDs, derivation paths, keys, passwords and signer descriptors stay intact.
+
+The metadata stores a random local ID and a salted check of a fixed derived public address;
+it stores no recovery phrase or root private key. Saving an encrypted recovery phrase remains
+optional. Older wallets have no seed ID until a subsequent import verifies their public
+Ethereum address or full Bitcoin account xpub against the supplied seed. Short master
+fingerprints and labels are never used as evidence of common origin.
+
+`import_seed_wallet` (custodian only) takes `sourceGroup`, `family` (`evm`, `bitcoin`, or
+`bitcoin_taproot`) and the corresponding import parameters. It requires either the phrase
+or a saved phrase ID and its password, plus the original BIP39 passphrase if applicable.
+It verifies that these belong to the source wallet before writing anything. An unsupported
+backend cannot silently ignore this check because the UI uses a distinct API method.
+Successful imports link matching legacy wallets; failed imports restore their prior metadata.
+
+`list_groups` includes a public `preview` for Bitcoin groups: `address`, `path` (the first receive
+path, ending in `/0/0`) and `firstReceiving: true`, or an `error` when the public record cannot
+be used. It derives from the stored account xpub without opening any encrypted key file.
