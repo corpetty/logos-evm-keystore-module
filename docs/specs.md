@@ -213,7 +213,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin, phrase }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `derive_account_at` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
+| `import_seed_wallet` | `params_json: String` | `import_mnemonic`'s reply for `family: "evm"`, `import_bitcoin`'s for a Bitcoin family. The phrase must be `sourceGroup`'s, checked before anything is written | yes → event |
 | `preview_addresses` | `params_json: String` | `{ ok, group, addresses: [..] }` | no |
+| `preview_mnemonic` | `params_json: String` | `{ ok, addresses: [..] }`: what a phrase (or a kept one with its password) would derive for a family and chain, written nowhere. Tier D | no |
 | `create_unrelated_account` | `params_json: String` | `{ ok, address, origin }`, or a refusal without the acknowledgement | yes → event |
 | `forget_derivation` | `params_json: String` | `{ ok, group, storage, recordUpdated, stranded, stagedRemoved }` | no |
 | `remove_group` | `params_json: String` | `{ ok, group, recordRemoved, nameRemoved }` | no — refuses while the wallet holds a key or an account |
