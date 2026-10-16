@@ -1349,8 +1349,10 @@ impl KeystoreModule for KeystoreModuleImpl {
         if let Ok(origins) = self.ks().and_then(|ks| ks.account_origins().map_err(|e| e.to_string())) {
             if let Some(rows) = reply["accounts"].as_array_mut() {
                 for row in rows {
-                    if let Some(origin) = row["address"].as_str().and_then(|a| {
-                        origins.iter().find(|(key, _)| key.eq_ignore_ascii_case(a)).map(|(_, v)| v)
+                    // An EVM account by its address, a Bitcoin wallet by its id.
+                    let key = row["address"].as_str().or_else(|| row["id"].as_str()).map(str::to_string);
+                    if let Some(origin) = key.and_then(|k| {
+                        origins.iter().find(|(key, _)| key.eq_ignore_ascii_case(&k)).map(|(_, v)| v)
                     }) { row["origin"] = origin.clone(); }
                 }
             }

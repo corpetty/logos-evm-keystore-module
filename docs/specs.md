@@ -213,7 +213,9 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `import_mnemonic` | `params_json: String` | `{ ok, address, path, group, storage, index, origin, phrase }` | yes → event |
 | `derive_next_account` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
 | `derive_account_at` | `params_json: String` | `{ ok, address, path, group, index, origin }` | yes → event |
+| `import_seed_wallet` | `params_json: String` | `import_mnemonic`'s reply for `family: "evm"`, `import_bitcoin`'s for a Bitcoin family. The phrase must be `sourceGroup`'s, checked before anything is written | yes → event |
 | `preview_addresses` | `params_json: String` | `{ ok, group, addresses: [..] }` | no |
+| `preview_mnemonic` | `params_json: String` | `{ ok, addresses: [..] }`: what a phrase (or a kept one with its password) would derive for a family and chain, written nowhere. Tier D | no |
 | `create_unrelated_account` | `params_json: String` | `{ ok, address, origin }`, or a refusal without the acknowledgement | yes → event |
 | `forget_derivation` | `params_json: String` | `{ ok, group, storage, recordUpdated, stranded, stagedRemoved }` | no |
 | `remove_group` | `params_json: String` | `{ ok, group, recordRemoved, nameRemoved }` | no — refuses while the wallet holds a key or an account |
@@ -1123,7 +1125,9 @@ the deepest key the wallet keeps; the root is never stored. `databaseKey` is 32 
 generated with the group and derived from nothing, for the wallet core's encrypted database.
 The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
-EVM records are written exactly as before; those fields are absent from them.
+An EVM record gains only `fingerprint`, the master fingerprint of the phrase it was made from,
+recorded while the seed is in memory; a Bitcoin import from the same phrase fills it in on older
+records.
 
 **Where its history starts.** The record also keeps `origin` and `birthday`, for the wallet core
 to know where to start scanning:
@@ -1216,9 +1220,12 @@ module that could reach `sign` past it would sign inside an unlock it was never 
 ### `signer_accounts() -> String`
 
 Every account as public material. An EVM account: `{ id: <address>, family: "evm", address, path?,
-label?, available: true }`, `path` only for a derived one. A Bitcoin wallet: `{ id: <group>, family:
-"bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'", fingerprint, xpub,
-label?, available: true }`.
+fingerprint?, label?, origin?, available: true }`, `path` only for a derived one, and `fingerprint`
+the master fingerprint of the phrase it was derived from, when known. A Bitcoin wallet: `{ id:
+<group>, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'",
+fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, phrase: { id, name },
+kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
+phrase, and `name` is one of their wallet names, the same for each.
 
 ### `sign(request_json: String) -> String`
 

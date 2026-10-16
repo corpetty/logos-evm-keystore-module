@@ -169,6 +169,17 @@ impl fmt::Debug for AccountSecret {
     }
 }
 
+/// A BIP39 seed's master fingerprint: which wallet it is, the same on every network and for every
+/// family, so an EVM account names the wallet it comes from as a Bitcoin one does.
+pub fn master_fingerprint(seed: &[u8]) -> Result<Fingerprint> {
+    let secp = Secp256k1::signing_only();
+    let mut master = Xpriv::new_master(NetworkKind::Main, seed).map_err(|e| bad(format!("bip32: {e}")))?;
+    let fingerprint = master.fingerprint(&secp);
+    master.private_key.non_secure_erase();
+    master.chain_code = ChainCode::from([0u8; 32]);
+    Ok(fingerprint)
+}
+
 impl AccountSecret {
     /// The account key and the master fingerprint, from a BIP39 seed.
     pub fn from_seed<C: Signing>(
