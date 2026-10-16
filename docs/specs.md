@@ -1123,7 +1123,9 @@ the deepest key the wallet keeps; the root is never stored. `databaseKey` is 32 
 generated with the group and derived from nothing, for the wallet core's encrypted database.
 The record in `groups.json` gains `family`, `chain`, `fingerprint` and `xpub`. They are public,
 but the xpub reveals the wallet's whole history, as an EVM vault's filename reveals its address.
-EVM records are written exactly as before; those fields are absent from them.
+An EVM record gains only `fingerprint`, the master fingerprint of the phrase it was made from,
+recorded while the seed is in memory; a Bitcoin import from the same phrase fills it in on older
+records.
 
 **Where its history starts.** The record also keeps `origin` and `birthday`, for the wallet core
 to know where to start scanning:
@@ -1216,9 +1218,12 @@ module that could reach `sign` past it would sign inside an unlock it was never 
 ### `signer_accounts() -> String`
 
 Every account as public material. An EVM account: `{ id: <address>, family: "evm", address, path?,
-label?, available: true }`, `path` only for a derived one. A Bitcoin wallet: `{ id: <group>, family:
-"bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'", fingerprint, xpub,
-label?, available: true }`.
+fingerprint?, label?, origin?, available: true }`, `path` only for a derived one, and `fingerprint`
+the master fingerprint of the phrase it was derived from, when known. A Bitcoin wallet: `{ id:
+<group>, family: "bitcoin" | "bitcoin_taproot", chain: "main" | "test", path: "m/84'/1'/0'",
+fingerprint, xpub, label?, origin?, available: true }`. `origin` is `{ devices, phrase: { id, name },
+kind, path }`, the signer interface's extension: `phrase.id` is the same for every account of one
+phrase, and `name` is one of their wallet names, the same for each.
 
 ### `sign(request_json: String) -> String`
 

@@ -367,14 +367,29 @@ pub fn info() -> SignerInfo {
     }
 }
 
-fn by_address<'m, V>(m: &'m std::collections::BTreeMap<String, V>, lower: &str) -> Option<&'m V> {
-    m.iter().find(|(k, _)| k.to_ascii_lowercase() == lower).map(|(_, v)| v)
+/// The keystore's documents key accounts by lowercase hex with no `0x`.
+fn by_address<'m, V>(m: &'m std::collections::BTreeMap<String, V>, address: &str) -> Option<&'m V> {
+    let bare = address.trim_start_matches("0x");
+    m.iter().find(|(k, _)| k.trim_start_matches("0x").eq_ignore_ascii_case(bare)).map(|(_, v)| v)
 }
 
 pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
     let labels = ks.get_labels().map_err(from_keystore)?;
     let provenance = ks.get_provenance().map_err(from_keystore)?;
     let names = ks.get_group_labels().map_err(from_keystore)?;
+    let groups = ks.get_groups().map_err(from_keystore)?;
+    // The wallet an EVM account comes from: its group's fingerprint, else one another group of the
+    // same seed recorded. An imported key belongs to no wallet.
+    let wallet_of = |gid: &str| {
+        let g = groups.get(gid)?;
+        g.fingerprint.clone().or_else(|| {
+            let seed = g.seed.as_ref()?;
+            groups
+                .values()
+                .filter(|o| o.seed.as_ref().is_some_and(|s| s.id == seed.id))
+                .find_map(|o| o.fingerprint.clone())
+        })
+    };
     let mut out = Vec::new();
     for addr in ks.list_accounts().map_err(from_keystore)? {
         let key = addr.to_string().to_ascii_lowercase();
@@ -383,7 +398,7 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             family: Family::Evm,
             chain: None,
             path: by_address(&provenance, &key).map(|p| p.path.clone()).filter(|p| !p.is_empty()),
-            fingerprint: None,
+            fingerprint: by_address(&provenance, &key).and_then(|p| wallet_of(&p.group)),
             address: Some(addr.to_string()),
             xpub: None,
             label: by_address(&labels, &key).cloned().filter(|l| !l.is_empty()),
@@ -592,6 +607,39 @@ mod tests {
             // A wrong password would answer wrong_secret: the item is refused first.
             assert_eq!(s.sign(req).unwrap_err().code, ErrorCode::Unsupported, "{}", account.id);
         }
+    }
+
+    #[test]
+    fn an_evm_account_names_the_wallet_it_comes_from() {
+        let (_dir, ks) = keystore();
+        let imported = accounts(&ks).unwrap().into_iter().find(|a| a.family == Family::Evm).unwrap();
+        assert_eq!(imported.fingerprint, None, "an imported key belongs to no wallet");
+        let derived = ks.import_mnemonic(PHRASE, "", 1, "pw").unwrap().to_string();
+        let all = accounts(&ks).unwrap();
+        let evm = all.iter().find(|a| a.address.as_deref() == Some(derived.as_str())).unwrap();
+        assert_eq!(evm.path.as_deref(), Some("m/44'/60'/0'/0/1"));
+        // The phrase's BIP32 master fingerprint, as its Bitcoin wallets carry it.
+        assert_eq!(evm.fingerprint.as_deref(), Some("16a93ed0"));
+        let segwit = all.iter().find(|a| a.family == Family::Bitcoin).unwrap();
+        assert_eq!(segwit.fingerprint, evm.fingerprint);
+    }
+
+    #[test]
+    fn a_bitcoin_wallet_has_an_origin_as_an_evm_account_does() {
+        let (_dir, ks) = keystore();
+        ks.import_mnemonic(PHRASE, "", 1, "pw").unwrap();
+        let segwit = accounts(&ks).unwrap().into_iter().find(|a| a.family == Family::Bitcoin).unwrap();
+        let origins = ks.account_origins().unwrap();
+        let o = &origins[&segwit.id];
+        assert_eq!(o["devices"][0]["kind"], "keystore");
+        assert_eq!(o["path"], "m/84'/1'/0'");
+        // The same seed as the EVM account derived from that phrase: one wallet.
+        let evm = origins
+            .iter()
+            .find(|(k, v)| k.starts_with("0x") && v["phrase"]["id"].is_string())
+            .map(|(_, v)| v)
+            .unwrap();
+        assert_eq!(o["phrase"]["id"], evm["phrase"]["id"]);
     }
 
     #[test]

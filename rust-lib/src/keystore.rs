@@ -893,8 +893,9 @@ pub struct Group {
     /// `main` or `test`, Bitcoin groups only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chain: Option<String>,
-    /// The master fingerprint and the account xpub, Bitcoin groups only. Public, but they reveal the
-    /// wallet's whole history, as an EVM vault's filename reveals its address.
+    /// The master fingerprint and the account xpub. Public, but they reveal the wallet's whole
+    /// history, as an EVM vault's filename reveals its address. The xpub is Bitcoin groups' only;
+    /// the fingerprint names the wallet for an EVM group too, recorded while its seed is in memory.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fingerprint: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1786,6 +1787,7 @@ impl Keystore {
         let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
         let account_key = seed.account_key(path.account)?;
         let (seed_link, prior_seeds) = self.seed_link(&seed)?;
+        let fingerprint = btc::master_fingerprint(seed.as_secret())?.to_string();
         let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
 
         let id = new_group_id();
@@ -1801,7 +1803,7 @@ impl Keystore {
             created_ms: now_ms(),
             family: None,
             chain: None,
-            fingerprint: None,
+            fingerprint: Some(fingerprint.clone()),
             xpub: None,
             phrase: phrase.clone(),
             origin: None,
@@ -1811,6 +1813,8 @@ impl Keystore {
             for old in prior_seeds.keys() {
                 if let Some(group) = groups.get_mut(old) {
                     group.seed = Some(seed_link.clone());
+                    // The same seed, so the same wallet: an older EVM group learns its name too.
+                    group.fingerprint.get_or_insert_with(|| fingerprint.clone());
                 }
             }
             groups.insert(id.clone(), record)
@@ -2211,26 +2215,34 @@ impl Keystore {
             .collect())
     }
 
-    /// Public source metadata only. A seed link is a verified local grouping, never words.
+    /// Public source metadata only. A seed link is a verified local grouping, never words. EVM
+    /// accounts are keyed by address; a Bitcoin wallet, which is its own group, by the group's id.
     pub fn account_origins(&self) -> Result<BTreeMap<String, serde_json::Value>> {
         let groups = self.get_groups()?;
         let labels = self.get_group_labels()?;
-        Ok(self.provenance_view()?.into_iter().map(|a| {
-            let p = a.provenance;
-            let group = groups.get(&p.group);
-            let phrase = group.map(|g| {
-                let id = g.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(&p.group);
+        let phrase_of = |gid: &str| {
+            groups.get(gid).map(|g| {
+                let id = g.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(gid);
                 // One deterministic name across the wallets linked to this seed.
-                let name = groups.iter().filter(|(gid, other)| {
-                    other.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(gid) == id
-                }).find_map(|(gid, _)| labels.get(gid).filter(|s| !s.trim().is_empty()));
+                let name = groups.iter().filter(|(other_id, other)| {
+                    other.seed.as_ref().map(|s| s.id.as_str()).unwrap_or(other_id) == id
+                }).find_map(|(other_id, _)| labels.get(other_id).filter(|s| !s.trim().is_empty()));
                 serde_json::json!({ "id": id, "name": name })
-            });
+            })
+        };
+        let devices = serde_json::json!([{ "id": "local", "kind": "keystore", "name": "" }]);
+        let mut out: BTreeMap<String, serde_json::Value> = self.provenance_view()?.into_iter().map(|a| {
+            let p = a.provenance;
             (a.address.to_string(), serde_json::json!({
-                "devices": [{ "id": "local", "kind": "keystore", "name": "" }],
-                "phrase": phrase, "kind": p.origin, "path": p.path
+                "devices": devices, "phrase": phrase_of(&p.group), "kind": p.origin, "path": p.path
             }))
-        }).collect())
+        }).collect();
+        for (gid, g) in groups.iter().filter(|(_, g)| g.family.is_some()) {
+            out.insert(gid.clone(), serde_json::json!({
+                "devices": devices, "phrase": phrase_of(gid), "kind": "derived", "path": g.path_prefix
+            }));
+        }
+        Ok(out)
     }
 
     /// Retire an index so it is never handed out again. A reused path may collide with an
@@ -2392,6 +2404,8 @@ impl Keystore {
             for old in prior_seeds.keys() {
                 if let Some(group) = groups.get_mut(old) {
                     group.seed = Some(seed_link.clone());
+                    // An EVM group of this seed learns which wallet it is.
+                    group.fingerprint.get_or_insert_with(|| fingerprint.to_string());
                 }
             }
             groups.insert(id.clone(), record)
@@ -3852,14 +3866,17 @@ mod tests {
     }
 
     #[test]
-    fn an_evm_group_record_is_written_exactly_as_before() {
+    fn an_evm_group_record_adds_only_its_wallet_fingerprint() {
         let dir = tempfile::tempdir().unwrap();
         let ks = Keystore::new(dir.path());
         ks.import_mnemonic_ex(&req(Storage::Extkey, 0)).unwrap();
         let record = std::fs::read_to_string(dir.path().join("groups.json")).unwrap();
-        for field in ["family", "chain", "fingerprint", "xpub"] {
+        for field in ["family", "chain", "xpub"] {
             assert!(!record.contains(field), "{field} in {record}");
         }
+        let groups = ks.get_groups().unwrap();
+        let fingerprint = groups.values().next().unwrap().fingerprint.as_deref().unwrap();
+        assert!(fingerprint.len() == 8 && fingerprint.bytes().all(|b| b.is_ascii_hexdigit()), "{fingerprint}");
     }
 
     #[test]

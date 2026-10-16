@@ -193,7 +193,7 @@ jobs:
             psbt::tests::signatures_verify_against_the_sighash_computed_independently \
             approval::tests::a_bitcoin_request_is_read_shown_and_signed_by_the_keystore \
             approval::tests::a_vault_holding_another_wallets_key_signs_nothing \
-            keystore::tests::an_evm_group_record_is_written_exactly_as_before \
+            keystore::tests::an_evm_group_record_adds_only_its_wallet_fingerprint \
             keystore::tests::a_bitcoin_wallet_is_refused_where_only_evm_derivation_belongs \
             every_mutation_a_reader_can_see_announces_itself_on_the_success_path \
             nothing_else_announces_and_no_read_path_does \
