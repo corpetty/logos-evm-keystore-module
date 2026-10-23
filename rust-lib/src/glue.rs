@@ -23,6 +23,7 @@ use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Key
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
 use crate::{BitcoinImport, WalletStart};
 use logos_signer_interface::jobs::{JobTable, KeyJobs};
+use logos_signer_interface::wallets::{read_data_key, DataKey, DataKeyRequest};
 use logos_signer_interface::{json as signer_json, wire};
 
 /// The keystore module's IPC contract. Each non-defaulted method is a callable
@@ -87,9 +88,9 @@ pub trait KeystoreModule: Send + 'static {
     /// writers that do, each keeping its own acknowledgement. Because "holds nothing" is the
     /// precondition, nothing signable is at stake and no password is asked for.
     fn remove_group(&mut self, params_json: String) -> String;
-    /// Derivation groups, `{ ok, groups: [...] }`. UNGATED, like `get_labels`: none of it
-    /// is a secret, and a wallet showing an account picker needs it. Includes STRANDED
-    /// groups — a derivation key on disk that no record names.
+    /// Derivation groups, `{ ok, groups: [...], lockedWallets }`. UNGATED, like `get_labels`: a
+    /// wallet showing an account picker needs it. Includes STRANDED groups — a derivation key on
+    /// disk that no record names. A wallet locked in the Signer app is not listed, only counted.
     fn list_groups(&mut self) -> String;
     /// What the key directory holds: `{ ok, groups, staged, unexplained }`. UNGATED. Reads
     /// the directory ONLY, so a wallet whose bookkeeping is unreadable can still be named —
@@ -280,6 +281,86 @@ include!(concat!(env!("CARGO_MANIFEST_DIR"), "/generated/provider_gen.rs"));
 /// The module behind `logos.wallets/1`: the signer manager, bound at runtime, since it depends on
 /// this keystore and this keystore can't depend on it.
 const WALLETS: &str = "signer_manager_module";
+
+/// A wallet's accounts open with this module's key for them, which the signer manager gives once
+/// the person unlocks the wallet in the Signer app, and close when it locks. Asked from threads
+/// of their own, never while answering the manager, which would wait on itself.
+fn watch_wallets(ks: Keystore) {
+    let mut client = wallets::WalletsClient::bind(WALLETS);
+    let changed = client.on_wallets_changed();
+    let locked = client.on_wallets_locked();
+    let k = ks.clone();
+    std::thread::spawn(move || {
+        open_wallets(&k);
+        if let Ok(sub) = changed {
+            for _ in sub {
+                open_wallets(&k);
+            }
+        }
+    });
+    if let Ok(sub) = locked {
+        std::thread::spawn(move || {
+            for _ in sub {
+                ks.lock_seeds();
+                announce_accounts(&ks);
+                // Only some may have locked.
+                open_wallets(&ks);
+            }
+        });
+    }
+}
+
+/// Every closed wallet's key; a locked one answers `locked` and stays closed.
+fn open_wallets(ks: &Keystore) {
+    let Ok(closed) = ks.closed_seeds() else { return };
+    let mut opened = false;
+    for (seed, sealed_under) in closed {
+        let Some(current) = data_key(&seed, None) else { continue };
+        let box_key = match sealed_under {
+            Some(g) if g != current.generation => match data_key(&seed, Some(g)) {
+                Some(k) => k,
+                None => continue,
+            },
+            _ => current.clone(),
+        };
+        // A call in flight holds the keystore's lock for a moment: wait it out.
+        for attempt in 0..5 {
+            match ks.open_seed(&seed, &box_key, &current) {
+                Ok(o) => {
+                    opened |= o;
+                    break;
+                }
+                Err(e) if attempt == 4 => eprintln!("keystore_module: a wallet's accounts didn't open: {e}"),
+                Err(_) => std::thread::sleep(Duration::from_millis(200)),
+            }
+        }
+    }
+    if opened {
+        announce_accounts(ks);
+    }
+}
+
+/// This module's key for a wallet's bookkeeping, named by the keystore's seed id.
+fn data_key(seed: &str, generation: Option<u32>) -> Option<DataKey> {
+    let body = serde_json::to_string(&DataKeyRequest {
+        seed: seed.to_string(),
+        scope: crate::index::SCOPE.into(),
+        generation,
+    })
+    .ok()?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    wallets::WalletsClient::bind(WALLETS).data_key_async_with_timeout(&body, Duration::from_secs(10), move |r| {
+        let _ = tx.send(r);
+    });
+    read_data_key(&rx.recv().ok()?.ok()?).ok()
+}
+
+/// Both account events, from outside a call.
+fn announce_accounts(ks: &Keystore) {
+    let count = ks.list_accounts().map_or(-1, |a| a.len() as i64);
+    emit_accounts_changed(count);
+    emit_signer_accounts_changed(count);
+}
 
 #[derive(Default)]
 struct KeystoreModuleImpl {
@@ -626,7 +707,9 @@ fn parse_secret_params<T: serde::de::DeserializeOwned>(
 impl KeystoreModule for KeystoreModuleImpl {
     fn on_context_ready(&mut self, ctx: &RustModuleContext) {
         let base = std::path::Path::new(&ctx.instance_persistence_path);
-        self.ks = Some(Keystore::new(base.join("keystore")));
+        let ks = Keystore::new(base.join("keystore"));
+        watch_wallets(ks.clone());
+        self.ks = Some(ks);
     }
 
     fn configure(&mut self, config_json: String) -> String {
@@ -963,7 +1046,8 @@ impl KeystoreModule for KeystoreModuleImpl {
                         })
                     })
                     .collect();
-                json!({ "ok": true, "groups": groups }).to_string()
+                let locked = self.ks().ok().and_then(|ks| ks.locked_wallets().ok()).unwrap_or(0);
+                json!({ "ok": true, "groups": groups, "lockedWallets": locked }).to_string()
             }
             Err(e) => err(e),
         }
