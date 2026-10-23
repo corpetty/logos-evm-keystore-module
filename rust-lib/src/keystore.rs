@@ -1839,6 +1839,16 @@ impl Keystore {
         Ok((&self.scan()?).into())
     }
 
+    /// The key directory as a reader sees it: a locked wallet's keys are not stranded, and
+    /// show once it unlocks. An unreadable index hides nothing, so no key turns undeletable.
+    pub fn listed_group_store(&self) -> Result<GroupStore> {
+        let mut store = self.group_store()?;
+        let hidden = self.view().map(|s| s.hidden().groups).unwrap_or_default();
+        store.keys.retain(|id| !hidden.contains(id));
+        store.staged.retain(|id| !hidden.contains(id));
+        Ok(store)
+    }
+
     /// Everything the keystore directory holds, classified. One scan is the authority for
     /// every question asked of it — what may be minted, what is derivable, what is
     /// deletable, and what is here that this keystore did not write — so those answers
@@ -1935,7 +1945,7 @@ impl Keystore {
     /// Derivation key ids on disk, at either path. This is what makes a stranded or
     /// half-written key nameable rather than permanent.
     pub fn list_derivation_keys(&self) -> Result<Vec<String>> {
-        Ok(self.scan()?.key_ids())
+        Ok(self.listed_group_store()?.ids())
     }
 
     /// Record only what is not already recorded, so walking past an existing account never
@@ -2455,6 +2465,9 @@ impl Keystore {
     /// Accounts already derived are untouched; what ends is adding MORE without the phrase.
     pub fn forget_derivation(&self, group: &str) -> Result<Forgotten> {
         check_group_id(group)?;
+        if self.view().is_ok_and(|s| s.hidden().groups.contains(group)) {
+            return Err(KeystoreError::Refused(format!("wallet {group} is locked: unlock it in the Signer app first")));
+        }
         // Readable bookkeeping only: an unreadable groups.json must not stop a key's removal.
         if self.get_groups().is_ok_and(|g| g.get(group).is_some_and(|g| g.family.is_some())) {
             return Err(KeystoreError::Refused(format!(
@@ -3105,6 +3118,9 @@ impl Keystore {
     /// password, like `forget_derivation`: removing a secret needs no proof of holding it.
     pub fn forget_phrase(&self, id: &str) -> Result<bool> {
         check_phrase_id(id)?;
+        if self.view().is_ok_and(|s| s.hidden().phrases.contains(id)) {
+            return Err(KeystoreError::Refused("this phrase's wallet is locked: unlock it in the Signer app first".into()));
+        }
         let removed = remove_path(&self.phrase_vault_path(id))?;
         let staged = remove_path(&self.phrase_stage_dir(id))?;
         self.update_groups(|groups| {
@@ -6729,6 +6745,15 @@ mod tests {
         assert!(fresh.list_accounts().unwrap().is_empty());
         assert!(fresh.list_groups().unwrap().is_empty(), "a locked wallet's keys are not stranded");
         assert!(fresh.kept_phrases().unwrap().is_empty(), "nor is its phrase listed");
+        assert!(fresh.list_derivation_keys().unwrap().is_empty(), "nor its derivation keys");
+        let key = ks.list_derivation_keys().unwrap();
+        let phrase = ks.kept_phrases().unwrap()[0].id.clone();
+        assert_eq!(key.len(), 2, "the EVM and the Bitcoin wallet's: {key:?}");
+        for k in &key {
+            assert!(format!("{}", fresh.forget_derivation(k).unwrap_err()).contains("locked"), "{k}");
+            assert!(dir.path().join(format!("groups/{k}.json")).exists(), "a refusal deleted nothing");
+        }
+        assert!(format!("{}", fresh.forget_phrase(&phrase).unwrap_err()).contains("locked"));
         assert!(fresh.account_report().unwrap().unexplained.is_empty(), "nor its vaults unexplained");
         assert!(fresh.provenance_view().unwrap().is_empty() && fresh.get_labels().unwrap().is_empty());
         assert!(!fresh.has_address(&ACCT0.to_string()));
@@ -6746,6 +6771,7 @@ mod tests {
             assert!(fresh.open_seed(s, &data_key(1, 0), &data_key(1, 1)).unwrap(), "sealed again under generation 1");
         }
         assert_eq!(fresh.list_accounts().unwrap().len(), 2);
+        assert_eq!(fresh.list_derivation_keys().unwrap(), key);
         assert!(fresh.sign_message(&ACCT0.to_string(), "pw", "hi").is_ok());
         assert!(Keystore::new(dir.path()).closed_seeds().unwrap().iter().all(|(_, g)| *g == Some(1)));
 

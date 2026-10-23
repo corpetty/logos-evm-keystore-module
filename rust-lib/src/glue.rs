@@ -1070,7 +1070,7 @@ impl KeystoreModule for KeystoreModuleImpl {
 
     fn list_derivation_keys(&mut self) -> String {
         let res = match self.ks() {
-            Ok(ks) => ks.group_store(),
+            Ok(ks) => ks.listed_group_store(),
             Err(e) => return err(e),
         };
         match res {
