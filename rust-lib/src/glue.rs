@@ -317,7 +317,11 @@ impl KeystoreModuleImpl {
                     "origin": e.origin, "birthday": e.birthday })
             .to_string(),
         );
-        wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+        // Not from this call: the first call to the manager waits for its connection in a nested
+        // event loop, where the next call into this module would wait on this one's lock.
+        std::thread::spawn(move || {
+            wallets::WalletsClient::bind(WALLETS).enroll_seed_async(&body, |_| {});
+        });
     }
 
     /// Both account events: the keystore's own, and the signer interface's.
