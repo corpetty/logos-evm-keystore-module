@@ -88,7 +88,7 @@ pub trait KeystoreModule: Send + 'static {
     /// writers that do, each keeping its own acknowledgement. Because "holds nothing" is the
     /// precondition, nothing signable is at stake and no password is asked for.
     fn remove_group(&mut self, params_json: String) -> String;
-    /// Derivation groups, `{ ok, groups: [...], lockedWallets }`. UNGATED, like `get_labels`: a
+    /// Derivation groups, `{ ok, groups: [...], lockedWallets, lockedSeeds }`. UNGATED, like `get_labels`: a
     /// wallet showing an account picker needs it. Includes STRANDED groups — a derivation key on
     /// disk that no record names. A wallet locked in the Signer app is not listed, only counted.
     /// Each group's `label` is its own name; `walletName` is its seed's.
@@ -1061,8 +1061,8 @@ impl KeystoreModule for KeystoreModuleImpl {
                         })
                     })
                     .collect();
-                let locked = self.ks().ok().and_then(|ks| ks.locked_wallets().ok()).unwrap_or(0);
-                json!({ "ok": true, "groups": groups, "lockedWallets": locked }).to_string()
+                let locked = self.ks().ok().and_then(|ks| ks.locked_seeds().ok()).unwrap_or_default();
+                json!({ "ok": true, "groups": groups, "lockedWallets": locked.len(), "lockedSeeds": locked }).to_string()
             }
             Err(e) => err(e),
         }

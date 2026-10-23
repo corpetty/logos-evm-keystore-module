@@ -2056,7 +2056,8 @@ lives one document per **seed**, each sealed (XChaCha20-Poly1305) under this mod
 that seed from the signer manager, `data_key(seed, "index")`. The manager gives that key once
 the person unlocks the wallet in the Signer app, and the module forgets it when the wallet
 locks, so **a locked wallet's accounts are not listed**: not by `list_accounts`, `list_groups`
-(which counts them as `lockedWallets`), `get_provenance`, `get_labels`, `kept_phrases`,
+(which counts them as `lockedWallets` and names them, by the manager's seed ids, as
+`lockedSeeds`, for an app's `wallets.unlock`), `get_provenance`, `get_labels`, `kept_phrases`,
 `list_derivation_keys`, nor the account the keystore offers the manager. Its vaults and keys are
 not unexplained or stranded either: `remove_unexplained`, `forget_derivation` and `forget_phrase`
 refuse them until it unlocks.

@@ -1643,7 +1643,12 @@ impl Keystore {
 
     /// How many of this keystore's wallets are locked in this process.
     pub fn locked_wallets(&self) -> Result<usize> {
-        Ok(self.view()?.locked_seeds().len())
+        Ok(self.locked_seeds()?.len())
+    }
+
+    /// The locked wallets, by the signer manager's seed ids: what an app asks it to unlock.
+    pub fn locked_seeds(&self) -> Result<Vec<String>> {
+        Ok(self.view()?.locked_seeds())
     }
 
     /// Move older builds' documents into the index, and give their address-named vaults random
@@ -6759,6 +6764,11 @@ mod tests {
         assert!(!fresh.has_address(&ACCT0.to_string()));
         assert!(fresh.sign_message(&ACCT0.to_string(), "pw", "hi").is_err());
         assert_eq!(fresh.locked_wallets().unwrap(), 2);
+        let mut locked = fresh.locked_seeds().unwrap();
+        locked.sort();
+        let mut want = seeds.clone();
+        want.sort();
+        assert_eq!(locked, want, "named by the manager's seed ids");
         for v in fresh.scan().unwrap().vaults {
             assert!(fresh.remove_unexplained(&format!("{v}.json"), true).is_err(), "a locked wallet's vault is removable");
         }
