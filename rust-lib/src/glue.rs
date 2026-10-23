@@ -91,7 +91,11 @@ pub trait KeystoreModule: Send + 'static {
     /// Derivation groups, `{ ok, groups: [...], lockedWallets }`. UNGATED, like `get_labels`: a
     /// wallet showing an account picker needs it. Includes STRANDED groups — a derivation key on
     /// disk that no record names. A wallet locked in the Signer app is not listed, only counted.
+    /// Each group's `label` is its own name; `walletName` is its seed's.
     fn list_groups(&mut self) -> String;
+    /// Name a wallet — every account file of one seed — `{ group, label, address?, password? }`
+    /// → `{ ok }`, `group` being any file of it, priced as `set_group_label` prices a name.
+    fn set_wallet_name(&mut self, params_json: String) -> String;
     /// What the key directory holds: `{ ok, groups, staged, unexplained }`. UNGATED. Reads
     /// the directory ONLY, so a wallet whose bookkeeping is unreadable can still be named —
     /// and therefore still deleted with `forget_derivation`. `staged` are ids an interrupted
@@ -525,8 +529,12 @@ struct ImportMnemonicParams {
     change: u32,
     #[serde(default, alias = "groupPassword")]
     group_password: String,
+    /// This account file's own name, empty by default.
     #[serde(default, alias = "groupLabel")]
     group_label: String,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    #[serde(default, alias = "walletName")]
+    wallet_name: String,
     /// Keep the phrase in a vault of its own, under this password.
     #[serde(default, rename = "keepPhrase")]
     keep_phrase: Option<PasswordParams>,
@@ -652,8 +660,12 @@ struct ImportBitcoinParams {
     #[serde(default)]
     account: u32,
     password: String,
+    /// This account's own name, empty by default.
     #[serde(default)]
     label: String,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    #[serde(default, alias = "walletName")]
+    wallet_name: String,
     /// Keep the phrase in a vault of its own, under this password.
     #[serde(default, rename = "keepPhrase")]
     keep_phrase: Option<PasswordParams>,
@@ -809,6 +821,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             change: p.change,
             group_password: &group_password,
             group_label: &p.group_label,
+            wallet_name: &p.wallet_name,
             keep,
         });
         match res {
@@ -1019,11 +1032,11 @@ impl KeystoreModule for KeystoreModuleImpl {
 
     fn list_groups(&mut self) -> String {
         let res = match self.ks() {
-            Ok(ks) => ks.list_groups(),
+            Ok(ks) => ks.list_groups().and_then(|rows| Ok((rows, ks.wallet_names()?))),
             Err(e) => return err(e),
         };
         match res {
-            Ok(rows) => {
+            Ok((rows, wallet_names)) => {
                 let groups: Vec<_> = rows
                     .into_iter()
                     .map(|g| {
@@ -1033,8 +1046,10 @@ impl KeystoreModule for KeystoreModuleImpl {
                                 Err(error) => json!({ "error": error }),
                             }
                         } else { serde_json::Value::Null };
+                        let seed = g.group.seed.as_ref().map_or(g.id.as_str(), |s| s.id.as_str());
                         json!({
                             "id": g.id, "storage": g.group.storage.as_str(),
+                            "walletName": wallet_names.get(seed),
                             "pathPrefix": g.group.path_prefix,
                             "seedId": g.group.seed.as_ref().map(|s| &s.id), "nextIndex": g.group.next_index,
                             "usedIndices": g.used_indices, "retiredIndices": g.group.retired,
@@ -1262,6 +1277,33 @@ impl KeystoreModule for KeystoreModuleImpl {
         };
         match self.ks() {
             Ok(ks) => match ks.set_group_label(&req) {
+                Ok(()) => {
+                    self.announce();
+                    json!({ "ok": true }).to_string()
+                }
+                Err(e) => err(e),
+            },
+            Err(e) => err(e),
+        }
+    }
+
+    fn set_wallet_name(&mut self, params_json: String) -> String {
+        if !self.may_mutate("set_wallet_name") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: GroupLabelParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let req = GroupLabelRequest {
+            group: &p.group,
+            label: &p.label,
+            address: &p.address,
+            password: &p.password,
+        };
+        match self.ks() {
+            Ok(ks) => match ks.set_wallet_name(&req) {
                 Ok(()) => {
                     self.announce();
                     json!({ "ok": true }).to_string()
@@ -1757,6 +1799,7 @@ impl KeystoreModule for KeystoreModuleImpl {
             account: p.account,
             password: &password,
             label: &p.label,
+            wallet_name: &p.wallet_name,
             keep,
             start,
         };

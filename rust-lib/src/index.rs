@@ -60,11 +60,18 @@ pub struct SeedDoc {
     pub labels: BTreeMap<String, String>,
     #[serde(default, rename = "groupLabels")]
     pub group_labels: BTreeMap<String, String>,
+    /// The wallet's name, by its seed: one per seed, over every account file of it.
+    #[serde(default, rename = "walletNames")]
+    pub wallet_names: BTreeMap<String, String>,
 }
 
 impl SeedDoc {
     fn is_empty(&self) -> bool {
-        self.groups.is_empty() && self.accounts.is_empty() && self.labels.is_empty() && self.group_labels.is_empty()
+        self.groups.is_empty()
+            && self.accounts.is_empty()
+            && self.labels.is_empty()
+            && self.group_labels.is_empty()
+            && self.wallet_names.is_empty()
     }
 
     /// Add what `other` holds that this doesn't.
@@ -80,6 +87,9 @@ impl SeedDoc {
         }
         for (k, v) in &other.group_labels {
             self.group_labels.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+        for (k, v) in &other.wallet_names {
+            self.wallet_names.entry(k.clone()).or_insert_with(|| v.clone());
         }
     }
 }
@@ -326,6 +336,9 @@ fn partition(doc: &SeedDoc, state: &State) -> BTreeMap<String, SeedDoc> {
     }
     for (id, name) in &doc.group_labels {
         out.entry(claim(group_seed(doc, state, id))).or_default().group_labels.insert(id.clone(), name.clone());
+    }
+    for (seed, name) in &doc.wallet_names {
+        out.entry(claim(seed.clone())).or_default().wallet_names.insert(seed.clone(), name.clone());
     }
     out
 }

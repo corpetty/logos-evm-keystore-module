@@ -234,6 +234,7 @@ is *defaulted*, so it is a framework hook and **not** part of the IPC contract.
 | `set_label` | `address, label, password: String` | `{ ok }` | no |
 | `get_labels` | — | `{ ok, labels: { <address>: <name> } }` | no |
 | `set_group_label` | `params_json: String` | `{ ok }` | no |
+| `set_wallet_name` | `params_json: String` | `{ ok }` | no |
 | `get_group_labels` | — | `{ ok, labels: { <groupId>: <name> } }` | no |
 | `request_approval` | `intent_json: String` | `{ ok, handle, receipt, state }` | no |
 | `approval_status` | `handle, receipt: String` | `{ ok, state, reason? }` | no |
@@ -565,7 +566,15 @@ the machine is showing, and the count in the payload does not move.
 | `set_label` | `address: String, label: String, password: String` | `{ ok: true }` |
 | `get_labels` | — | `{ ok: true, labels: { "<address>": "<name>" } }` |
 | `set_group_label` | `params_json: String` — `{ group, label, address?, password? }` | `{ ok: true }` |
+| `set_wallet_name` | `params_json: String` — `{ group, label, address?, password? }` | `{ ok: true }` |
 | `get_group_labels` | — | `{ ok: true, labels: { "<groupId>": "<name>" } }` |
+
+**A wallet's name is its seed's; an account file's is its own.** `set_wallet_name` names the
+wallet — every account file of one seed, shown as the header over them — with `group` any file of
+it, priced as `set_group_label` prices a name. `list_groups` gives each file's `walletName`, and
+the imports take `walletName`, kept for a seed that has none yet. A file's `label` is its own name,
+empty unless the person gives one. An older keys app copied the wallet's name onto every file and
+account: the first `set_wallet_name` of that seed takes the copy off them.
 
 ```bash
 logosctl call keystore_module set_group_label \

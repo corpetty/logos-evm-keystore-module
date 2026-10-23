@@ -55,10 +55,11 @@ custodians and managers.
 pickers: `{ ok, wallets: { "<address>": { wallet, index? } } }`. Accounts without a
 named derivation group are omitted rather than assigned a guessed wallet.
 
-A wallet is named like an account is: `set_group_label` writes, an empty string clears,
-and `get_group_labels` answers from the wallet names alone — so the name survives the
-record and the key it belonged to, which is the row a UI most needs to name. Duplicates
-are storable on purpose; uniqueness is the reader's problem.
+A wallet is named like an account is: `set_wallet_name` names the wallet — every account
+file of one seed — and `set_group_label` one account file, each empty unless the person gives
+a name; an empty string clears. `get_group_labels` answers from the names alone — so a name
+survives the record and the key it belonged to, which is the row a UI most needs to name.
+Duplicates are storable on purpose; uniqueness is the reader's problem.
 
 **A locked wallet lists nothing.** The records, accounts and names are kept one document per
 seed, sealed under this module's key for that seed from the signer manager (`data_key(seed,

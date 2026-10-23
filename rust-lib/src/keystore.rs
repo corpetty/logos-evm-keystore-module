@@ -189,6 +189,30 @@ fn restrict_permissions(path: &Path, mode: u32) -> Result<()> {
     atomic::set_mode(path, mode).map_err(|e| KeystoreError::Io(e.to_string()))
 }
 
+/// Before a seed's wallet had a name of its own, an older keys app copied it onto each of the
+/// seed's files and accounts: one text, on every one that has a name, which a reader shows as the
+/// wallet's. When the wallet is first named, that copy comes off them.
+fn adopt_copied_name(d: &mut SeedDoc, seed: &str) {
+    if d.wallet_names.contains_key(seed) {
+        return;
+    }
+    let groups: Vec<String> = d
+        .groups
+        .iter()
+        .filter(|(id, _)| Keystore::seed_of_group(&d.groups, id) == seed)
+        .map(|(id, _)| id.clone())
+        .collect();
+    let names: std::collections::BTreeSet<&String> =
+        groups.iter().filter_map(|id| d.group_labels.get(id)).filter(|n| !n.trim().is_empty()).collect();
+    let [copied] = names.into_iter().collect::<Vec<_>>()[..] else { return };
+    let copied = copied.clone();
+    d.group_labels.retain(|id, n| !(groups.contains(id) && *n == copied));
+    let accounts: Vec<String> =
+        d.accounts.iter().filter(|(_, p)| groups.contains(&p.group)).map(|(a, _)| a.clone()).collect();
+    d.labels.retain(|a, n| !(accounts.contains(a) && *n == copied));
+    d.wallet_names.insert(seed.to_string(), copied);
+}
+
 /// An account's key in the index: lowercase hex, no 0x.
 fn addr_key(addr: &Address) -> String {
     format!("{:x}", addr)
@@ -404,6 +428,7 @@ impl Keystore {
             change: 0,
             group_password: "",
             group_label: "",
+            wallet_name: "",
             keep: KeepPhrase::No,
         })
         .map(|d| d.address)
@@ -531,6 +556,7 @@ impl Keystore {
         let id = account_or_group.trim();
         let groups = self.get_groups()?;
         let names = self.get_group_labels()?;
+        let wallets = self.wallet_names()?;
         let (seed, name, origin, birthday) = match groups.get(id) {
             Some(g) => (
                 Self::seed_of_group(&groups, id),
@@ -549,6 +575,7 @@ impl Keystore {
             }
         };
         let unlock_key = self.unlock_key(&seed, 0, password)?;
+        let name = wallets.get(&seed).cloned().filter(|n| !n.is_empty()).or(name);
         // The name shows while the wallet is locked, so it never comes from an address.
         let name = name.unwrap_or_else(|| {
             if seed.starts_with(IMPORTED_SEED) { "Imported key".into() } else { "Keystore wallet".into() }
@@ -1286,7 +1313,10 @@ pub struct ImportRequest<'a> {
     pub bip44_account: u32,
     pub change: u32,
     pub group_password: &'a str,
+    /// This account file's own name, empty by default.
     pub group_label: &'a str,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    pub wallet_name: &'a str,
     /// Keep the phrase too, or record one kept earlier. The BIP39 passphrase never is.
     pub keep: KeepPhrase<'a>,
 }
@@ -1636,6 +1666,7 @@ impl Keystore {
             accounts: self.read_json(&self.root.path(&Slot::Doc(Doc::Accounts)))?,
             labels: self.read_json(&self.root.path(&Slot::Doc(Doc::Labels)))?,
             group_labels: self.read_json(&self.root.path(&Slot::Doc(Doc::GroupLabels)))?,
+            wallet_names: BTreeMap::new(),
         };
         let state = index::load(&self.root, &self.keys)?;
         let mut doc = state.merged();
@@ -1702,6 +1733,56 @@ impl Keystore {
     /// unable to show the truth.
     pub fn set_group_label(&self, req: &GroupLabelRequest) -> Result<()> {
         let id = req.group;
+        let recorded = self.prove_naming(req)?;
+        // A name an older build wrote into the record moves out first, or clearing one here
+        // would only reveal the older name still sitting underneath it.
+        if recorded.get(id).is_some_and(|g| !g.label.trim().is_empty()) {
+            self.update_groups(|groups| {
+                if let Some(g) = groups.get_mut(id) {
+                    g.label = String::new();
+                }
+            })?;
+        }
+        self.write_group_label(id, req.label)
+    }
+
+    /// Name a wallet — every account file of one seed, as the header over them shows it — or
+    /// clear the name with an empty string. `group` is any file of the seed, and prices the name
+    /// as `set_group_label` does. The account files keep names of their own, empty by default.
+    pub fn set_wallet_name(&self, req: &GroupLabelRequest) -> Result<()> {
+        let recorded = self.prove_naming(req)?;
+        let seed = Self::seed_of_group(&recorded, req.group);
+        let name = req.label.trim().to_string();
+        self.update_index(|d| {
+            adopt_copied_name(d, &seed);
+            if name.is_empty() {
+                d.wallet_names.remove(&seed);
+            } else {
+                d.wallet_names.insert(seed.clone(), name.clone());
+            }
+        })
+    }
+
+    /// Wallet names, by the seed they name.
+    pub fn wallet_names(&self) -> Result<BTreeMap<String, String>> {
+        Ok(self.view()?.merged().wallet_names)
+    }
+
+    /// Name a new seed's wallet, unless it has a name already.
+    fn name_new_wallet(&self, seed: &str, name: &str) -> Result<()> {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            return Ok(());
+        }
+        check_displayable(&name, "wallet name")?;
+        self.update_index(|d| {
+            d.wallet_names.entry(seed.to_string()).or_insert(name);
+        })
+    }
+
+    /// What setting a name on `req.group` costs, checked; the records it read.
+    fn prove_naming(&self, req: &GroupLabelRequest) -> Result<BTreeMap<String, Group>> {
+        let id = req.group;
         check_group_id(id)?;
         // Its record, its key, an account that came from it, or a name already standing over
         // it: a wallet a reader can SEE is one it can name, and a stranded key or a leftover
@@ -1744,16 +1825,7 @@ impl Keystore {
                 self.prove_group_custody(&store, id, req.password)?;
             }
         }
-        // A name an older build wrote into the record moves out first, or clearing one here
-        // would only reveal the older name still sitting underneath it.
-        if recorded.get(id).is_some_and(|g| !g.label.trim().is_empty()) {
-            self.update_groups(|groups| {
-                if let Some(g) = groups.get_mut(id) {
-                    g.label = String::new();
-                }
-            })?;
-        }
-        self.write_group_label(id, req.label)
+        Ok(recorded)
     }
 
     /// Everything the key directory holds — live keys, staged ones, and anything the layout
@@ -2144,6 +2216,7 @@ impl Keystore {
     /// derived without the phrase. Creates the group.
     pub fn import_mnemonic_ex(&self, req: &ImportRequest) -> Result<Derived> {
         let path = Bip44Path::new(req.bip44_account, req.change, req.index)?;
+        check_displayable(req.wallet_name, "wallet name")?;
         if req.storage == Storage::Extkey && req.group_password.is_empty() {
             return Err(KeystoreError::InvalidParams(
                 "keeping a derivation key needs a password of its own".into(),
@@ -2200,6 +2273,7 @@ impl Keystore {
             }
             self.persist_derived(&account_key, &id, path, req.password)
         })();
+        let landed = landed.and_then(|d| self.name_new_wallet(&seed_link.id, req.wallet_name).map(|()| d));
 
         landed.inspect_err(|_| {
             // Both paths the key can occupy, not just the final one: rolling back only the
@@ -2658,7 +2732,10 @@ pub struct BitcoinImport<'a> {
     pub account: u32,
     /// The vault's password: it guards the account key and the database key.
     pub password: &'a str,
+    /// This account's own name, empty by default.
     pub label: &'a str,
+    /// The wallet's name, kept for its seed when the seed has none yet.
+    pub wallet_name: &'a str,
     pub keep: KeepPhrase<'a>,
     pub start: WalletStart<'a>,
 }
@@ -2716,6 +2793,7 @@ impl Keystore {
             return Err(KeystoreError::InvalidParams("a Bitcoin wallet's vault needs a password".into()));
         }
         check_displayable(req.label, "label")?;
+        check_displayable(req.wallet_name, "wallet name")?;
         match (req.start, req.keep) {
             (WalletStart::Created, KeepPhrase::Kept(_)) => {
                 return Err(KeystoreError::InvalidParams(
@@ -2794,7 +2872,8 @@ impl Keystore {
         .inspect_err(|_| forget_new_phrase())?;
         let landed = (|| {
             self.write_group_label(&id, req.label)?;
-            self.write_group_vault(&id, &text, req.password)
+            self.write_group_vault(&id, &text, req.password)?;
+            self.name_new_wallet(&seed_link.id, req.wallet_name)
         })();
         landed.inspect_err(|_| {
             let _ = remove_path(&self.group_vault_path(&id));
@@ -3854,6 +3933,7 @@ mod tests {
             change: 0,
             group_password: "gp",
             group_label: "Main",
+            wallet_name: "",
             keep: KeepPhrase::No,
         }
     }
@@ -3900,6 +3980,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "Savings",
+            wallet_name: "",
             keep: crate::keystore::KeepPhrase::No,
             start: crate::keystore::WalletStart::Restored(None),
         })
@@ -3918,7 +3999,7 @@ mod tests {
                 let ks = Keystore::new(dir.path());
                 let group = ks.import_bitcoin(&BitcoinImport {
                     phrase, bip39_passphrase: "", family, chain, account: 0,
-                    password: "pw", label: "Savings", keep: KeepPhrase::No,
+                    password: "pw", label: "Savings", wallet_name: "", keep: KeepPhrase::No,
                     start: WalletStart::Restored(None),
                 }).unwrap();
                 // A public-only copy has neither encrypted keys nor a recovery phrase.
@@ -3967,6 +4048,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "",
+            wallet_name: "",
             keep,
             start,
         })
@@ -4103,6 +4185,7 @@ mod tests {
             account: 0,
             password: "pw",
             label: "",
+            wallet_name: "",
             keep,
             start: WalletStart::Restored(None),
         })
@@ -4199,6 +4282,7 @@ mod tests {
                 account: 0,
                 password: "pw",
                 label: "",
+                wallet_name: "",
                 keep: KeepPhrase::Kept(&id),
                 start: WalletStart::Restored(None),
             })
@@ -6756,5 +6840,69 @@ mod tests {
         }
         assert!(!names.contains(&addr_key(&key)) && !names.contains(&addr_key(&d.address)), "{names}");
         assert!(moved.closed_seeds().unwrap().iter().all(|(s, _)| s.starts_with("g_") || s.starts_with("k_")));
+    }
+
+    // ---- a wallet's name is its seed's; an account file's is its own -----------------
+
+    fn seed_of(ks: &Keystore, group: &str) -> String {
+        Keystore::seed_of_group(&ks.get_groups().unwrap(), group)
+    }
+
+    #[test]
+    fn a_new_wallet_takes_its_name_and_each_account_only_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let first = ks
+            .import_mnemonic_ex(&ImportRequest { group_label: "", wallet_name: "Main wallet", ..req(Storage::Plain, 0) })
+            .unwrap();
+        let seed = seed_of(&ks, &first.group);
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Main wallet");
+        assert!(ks.get_group_labels().unwrap().is_empty(), "an account file has no name unless given one");
+        assert_eq!(ks.enrolment(&first.address.to_string(), "pw").unwrap().name, "Main wallet");
+
+        // Another account of the same phrase: its own name, and the wallet's is untouched.
+        let savings = ks
+            .import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Savings", wallet_name: "Ignored", ..req(Storage::Plain, 0) })
+            .unwrap();
+        assert_eq!(seed_of(&ks, &savings.group), seed);
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Main wallet");
+        assert_eq!(ks.get_group_labels().unwrap()[&savings.group], "Savings");
+        assert!(!ks.get_group_labels().unwrap().contains_key(&first.group));
+
+        // Renaming the wallet needs what naming a file needs.
+        let e = ks.set_wallet_name(&rename(&first.group, "Daily")).unwrap_err();
+        assert!(format!("{e}").contains("needs the password of one of them"), "{e}");
+        ks.set_wallet_name(&rename_as(&first.group, "Daily", &first.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "Daily");
+        assert_eq!(ks.get_group_labels().unwrap()[&savings.group], "Savings");
+        ks.set_wallet_name(&rename(&first.group, "")).unwrap();
+        assert!(ks.wallet_names().unwrap().is_empty(), "clearing asks for nothing");
+    }
+
+    #[test]
+    fn the_name_an_older_keys_app_copied_onto_every_file_becomes_the_wallets() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        // What the older keys app wrote: the wallet's name on every file, and on each account.
+        let a = ks.import_mnemonic_ex(&ImportRequest { group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        let b = ks.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Old", ..req(Storage::Plain, 0) }).unwrap();
+        ks.set_label(&a.address.to_string(), "Old", "pw").unwrap();
+        let seed = seed_of(&ks, &a.group);
+        assert!(ks.wallet_names().unwrap().is_empty(), "adding an account adopts nothing");
+
+        // Naming the wallet takes the copy off its files and accounts.
+        ks.set_wallet_name(&rename_as(&a.group, "New", &a.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks.wallet_names().unwrap()[&seed], "New");
+        let files = ks.get_group_labels().unwrap();
+        assert!(!files.contains_key(&a.group) && !files.contains_key(&b.group), "{files:?}");
+        assert!(ks.get_labels().unwrap().is_empty(), "the copy on the account went too");
+
+        // Two different names are names of their own, and stay.
+        let d2 = tempfile::tempdir().unwrap();
+        let ks2 = Keystore::new(d2.path());
+        let x = ks2.import_mnemonic_ex(&ImportRequest { group_label: "One", ..req(Storage::Plain, 0) }).unwrap();
+        ks2.import_mnemonic_ex(&ImportRequest { index: 1, group_label: "Two", ..req(Storage::Plain, 0) }).unwrap();
+        ks2.set_wallet_name(&rename_as(&x.group, "Both", &x.address.to_string(), "pw")).unwrap();
+        assert_eq!(ks2.get_group_labels().unwrap().len(), 2);
     }
 }
