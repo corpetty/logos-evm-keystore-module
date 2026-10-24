@@ -1186,6 +1186,52 @@ because rust-bitcoin's lookup for an `Xpriv` matches only a master key or the le
 **Residual.** rust-bitcoin's `Xpriv` is `Copy` and has no `Zeroize`, so derivation leaves
 copies of keys and chain codes the module cannot wipe; `AccountSecret` wipes its own on drop.
 
+## Identity keys (`ed25519`)
+
+An identity key is an Ed25519 key for being someone somewhere, rather than for holding coins: a
+member's authorship key in one chat room, for instance. Apps that coordinate in rooms (Muster
+first) derive a fresh one per room so that their memberships cannot be linked, and need the same
+key back after a restore. The keystore makes them from the phrase it already holds, so the phrase
+stays in one place.
+
+**What an identity group keeps.** One SLIP-0010 node, `m/7432'/0'`, and never the root, as every
+other group keeps its account level. Its vault, at `groups/<id>.json` like the others, holds
+`{ v: 1, family: "ed25519", node }` inside the same scrypt envelope, `node` being the node's key
+and chain code. Its record in `groups.json` has `family: "ed25519"`, `pathPrefix: "m/7432'/0'"`,
+the phrase's `fingerprint`, `nodeKey` (the node's own public key, which every opening checks the
+vault against), and `identities`, the keys made so far. A group comes from a typed phrase or a
+kept one, and there is one per phrase and passphrase. `forget_derivation` refuses it: its vault
+holds its only key.
+
+**Each identity key** is named by a **purpose** (`room-identity`, `lez-msig-approval`, …: 1–64 of
+`a–z 0–9 - .`) and a **context** (the app's name for where it is used: a room, a multisig;
+displayable, 1–512 bytes):
+
+```
+m / 7432' / 0' / c0' / … / c7'      every level hardened (SLIP-0010 has no other kind for Ed25519)
+```
+
+`c0 … c7` are the first 248 bits, in 31-bit pieces, of SHA-256 over the dCBOR record
+`["logos.signer.context.v1", {context, purpose}]`. So the same phrase gives the same key for the
+same purpose and context on every device, two contexts give two keys nobody can link, and adding
+one opens the node, never the phrase. `7432'` is provisional and registered nowhere.
+
+| Method | Tier | |
+|---|---|---|
+| `import_identity` | D | `{ phrase, passphrase?, password, label?, keepPhrase?: { password } }`, or `{ keptPhrase, phrasePassword, … }` in place of `phrase` → `{ ok, group, fingerprint, phrase }` |
+| `derive_identity` | D | `{ group?, purpose, context, password }` → `{ ok, account, publicKey, purpose, context }`. Idempotent: asking again answers the same key and records nothing |
+
+Both announce. `group` may be omitted while there is one identity group.
+
+**As a signer.** Every identity key is a `logos.signer/1` account of family `ed25519`: `id` is its
+key ref, `kr_` and 16 bytes of SHA-256 over `["logos.signer.keyref.v1", {node, scheme, purpose,
+context}]`, stable across a restore and naming no path; `address` is the Ed25519 public key; the
+`fingerprint` is the phrase's; there is no `path` and no `xpub`; the label is the purpose (after the
+wallet's name, when it has one). The context is not listed: it may name a room. A `hash` item with
+scheme `ed25519` and no path is signed as Ed25519 over its 32 bytes, with the password or inside an
+unlock, as every other account is. The family is on the signer interface's
+`feat/ed25519-family` branch (corpetty/logos-signer-interface `3ebac51`), proposed upstream.
+
 ## The keystore as a signer (`logos.signer/1`)
 
 The keystore implements [`logos.signer/1`](https://github.com/logos-co/logos-signer-interface),
@@ -1203,7 +1249,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
 | `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
-| `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
+| `import_bitcoin`, `import_identity`, `derive_identity`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
 | `account_descriptors` | a configured **manager** or **custodian**: a descriptor's xpub shows the wallet's whole history |
@@ -1215,7 +1261,8 @@ module that could reach `sign` past it would sign inside an unlock it was never 
 ### `signer_info() -> String`
 
 `{ ok, interface: "logos.signer/1", kind: "keystore", model: "scrypt key files", families: ["evm",
-"bitcoin", "bitcoin_taproot"], requestKinds: ["hash"], showsRequest: false, collects: "password" }`.
+"bitcoin", "bitcoin_taproot", "ed25519"], requestKinds: ["hash"], showsRequest: false, collects:
+"password" }`.
 
 ### `signer_accounts() -> String`
 
@@ -1367,7 +1414,7 @@ Every request is classified by the **caller identity** the platform reports
 | **A** | `pending`, `acknowledge`, `approve`, `reject` | a configured **approver** (default `evm_signer_ui`) |
 | **B** | `request_approval`, `approval_status`, `fetch_result`, `ack_result`, `cancel_approval` | any **named module**; `fetch`/`ack`/`cancel`/`status` additionally require the **receipt** |
 | **C** | reads: `list_accounts`, `has_address`, `get_labels`, `get_group_labels`, `list_groups`, `list_derivation_keys`, `get_provenance`, `get_account_wallets`, `caller_identity`, `list_phrases` — and, for now, `configure` | ungated |
-| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
+| **D** | account mutation: `create_mnemonic`, `import_mnemonic`, `import_private_key`, `import_keystore_json`, `export_keystore_json`, `delete_account`, `change_password`, `set_label`, `set_group_label`, `derive_next_account`, `derive_account_at`, `preview_addresses`, `create_unrelated_account`, `forget_derivation`, `import_bitcoin`, `import_identity`, `derive_identity`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (default `evm_keystore_ui`) |
 | **M** | the signer interface's signing calls and the keys an unlock holds — see [the keystore as a signer](#the-keystore-as-a-signer-logossigner1) | a configured **manager** (default `signer_manager_module`) |
 
 Tier D is a **registry**, not a per-method `if`: `gate::TIER_D_METHODS` lists the
