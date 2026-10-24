@@ -1646,7 +1646,7 @@ impl Keystore {
         Ok(self.locked_seeds()?.len())
     }
 
-    /// The locked wallets, by the signer manager's seed ids: what an app asks it to unlock.
+    /// The locked wallets, by the names the keystore gives the signer manager for them.
     pub fn locked_seeds(&self) -> Result<Vec<String>> {
         Ok(self.view()?.locked_seeds())
     }
@@ -6768,7 +6768,7 @@ mod tests {
         locked.sort();
         let mut want = seeds.clone();
         want.sort();
-        assert_eq!(locked, want, "named by the manager's seed ids");
+        assert_eq!(locked, want, "named as the keystore names them to the manager");
         for v in fresh.scan().unwrap().vaults {
             assert!(fresh.remove_unexplained(&format!("{v}.json"), true).is_err(), "a locked wallet's vault is removable");
         }
