@@ -200,6 +200,9 @@ pub const TIER_D_METHODS: &[&str] = &[
     "remove_unexplained",
     // A Bitcoin wallet from a phrase: a mutation like any import.
     "import_bitcoin",
+    // Identity keys: a group from a phrase, then one key per purpose and context from its node.
+    "import_identity",
+    "derive_identity",
     // A kept phrase: showing its words is for the keys app alone, and forgetting it removes
     // key material, as `forget_derivation` does.
     "show_phrase",

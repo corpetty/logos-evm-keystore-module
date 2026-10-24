@@ -411,9 +411,11 @@ impl Keystore {
         } else {
             self.stage_dir(id).join(Slot::staged_name(&StageKind::Group(id.to_string())))
         };
-        let bitcoin = self.get_groups()?.get(id).is_some_and(|g| g.family.is_some());
-        let opened = if bitcoin {
+        let record = self.get_groups()?.get(id).cloned();
+        let opened = if record.as_ref().is_some_and(Group::is_bitcoin) {
             self.open_bitcoin_vault_at(&path, password).map(drop)
+        } else if record.as_ref().is_some_and(Group::is_identity) {
+            self.open_identity_vault_at(&path, password).map(drop)
         } else {
             self.open_group_vault(&path, password).map(drop)
         };
@@ -909,6 +911,38 @@ pub struct Group {
     /// The first day the wallet could have received coins, `YYYY-MM-DD` in UTC, when known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub birthday: Option<String>,
+    /// An identity group's node public key, hex: how its vault is checked to be this group's.
+    #[serde(rename = "nodeKey", default, skip_serializing_if = "Option::is_none")]
+    pub node_key: Option<String>,
+    /// An identity group's keys, one per purpose and context. Public: the purpose, the context
+    /// and the public key, never a path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub identities: Vec<IdentityKey>,
+}
+
+/// One identity key of an identity group.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityKey {
+    /// Its `logos.signer/1` account id.
+    #[serde(rename = "keyRef")]
+    pub key_ref: String,
+    pub purpose: String,
+    pub context: String,
+    /// The Ed25519 public key, hex.
+    #[serde(rename = "publicKey")]
+    pub public_key: String,
+}
+
+impl Group {
+    /// A Bitcoin wallet: its record names a Bitcoin family.
+    pub fn is_bitcoin(&self) -> bool {
+        matches!(self.family.as_deref(), Some("bitcoin" | "bitcoin_taproot"))
+    }
+
+    /// An identity group: its record names the `ed25519` family.
+    pub fn is_identity(&self) -> bool {
+        self.family.as_deref() == Some(crate::identity::FAMILY)
+    }
 }
 
 /// Where one account came from. Kept beside the vaults for the same reason labels are: a
@@ -1657,9 +1691,14 @@ impl Keystore {
     /// Resolve a group that must be able to derive, and the BIP-44 account it is pinned to.
     fn derivable_group(&self, id: Option<&str>) -> Result<(String, Group, u32)> {
         let (id, g) = self.resolve_group(id)?;
-        if g.family.is_some() {
+        if g.is_bitcoin() {
             return Err(KeystoreError::Refused(format!(
                 "wallet {id} is a Bitcoin wallet; its addresses come from its descriptors, not from here"
+            )));
+        }
+        if g.is_identity() {
+            return Err(KeystoreError::Refused(format!(
+                "wallet {id} holds identity keys; add one with derive_identity, not as an EVM account"
             )));
         }
         if g.storage != Storage::Extkey {
@@ -1707,6 +1746,11 @@ impl Keystore {
     fn seed_matches_group(&self, seed: &Seed, id: &str, group: &Group) -> Result<bool> {
         if let Some(link) = &group.seed {
             return Ok(Self::seed_check(seed, &link.id)? == link.check);
+        }
+        if group.is_identity() {
+            // An identity group always records its seed link; without one, its node key says it.
+            let node = crate::identity::Node::group_node(seed.as_secret());
+            return Ok(group.node_key.as_deref() == Some(hex::encode(node.public_key()).as_str()));
         }
         if let Some(family) = &group.family {
             let family = Family::parse(family)?;
@@ -1808,6 +1852,8 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: None,
             birthday: None,
+            node_key: None,
+            identities: Vec::new(),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             for old in prior_seeds.keys() {
@@ -2017,7 +2063,7 @@ impl Keystore {
         // Readable bookkeeping only: an unreadable groups.json must not stop a key's removal.
         if self.get_groups().is_ok_and(|g| g.get(group).is_some_and(|g| g.family.is_some())) {
             return Err(KeystoreError::Refused(format!(
-                "wallet {group} is a Bitcoin wallet, and this key is its only one: forgetting it is deleting the wallet"
+                "wallet {group} keeps this key as its only one (a Bitcoin wallet or identity keys): forgetting it is deleting the wallet"
             )));
         }
         let removed_key = remove_path(&self.group_vault_path(group))?;
@@ -2160,6 +2206,8 @@ impl Keystore {
                     phrase: None,
                     origin: None,
                     birthday: None,
+                    node_key: None,
+                    identities: Vec::new(),
                 },
                 used_indices: Vec::new(),
                 account_count,
@@ -2237,10 +2285,18 @@ impl Keystore {
                 "devices": devices, "phrase": phrase_of(&p.group), "kind": p.origin, "path": p.path
             }))
         }).collect();
-        for (gid, g) in groups.iter().filter(|(_, g)| g.family.is_some()) {
+        for (gid, g) in groups.iter().filter(|(_, g)| g.is_bitcoin()) {
             out.insert(gid.clone(), serde_json::json!({
                 "devices": devices, "phrase": phrase_of(gid), "kind": "derived", "path": g.path_prefix
             }));
+        }
+        // An identity account names its wallet and phrase, never its path.
+        for (gid, g) in groups.iter().filter(|(_, g)| g.is_identity()) {
+            for k in &g.identities {
+                out.insert(k.key_ref.clone(), serde_json::json!({
+                    "devices": devices, "phrase": phrase_of(gid), "kind": "derived"
+                }));
+            }
         }
         Ok(out)
     }
@@ -2399,6 +2455,8 @@ impl Keystore {
             phrase: phrase.clone(),
             origin: Some(origin.into()),
             birthday,
+            node_key: None,
+            identities: Vec::new(),
         };
         self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
             for old in prior_seeds.keys() {
@@ -2524,7 +2582,7 @@ impl Keystore {
 
     /// The ids of every Bitcoin wallet whose record names its family.
     pub fn bitcoin_groups(&self) -> Result<Vec<String>> {
-        Ok(self.get_groups()?.into_iter().filter(|(_, g)| g.family.is_some()).map(|(id, _)| id).collect())
+        Ok(self.get_groups()?.into_iter().filter(|(_, g)| g.is_bitcoin()).map(|(id, _)| id).collect())
     }
 
     fn open_bitcoin_vault_at(&self, path: &Path, password: &str) -> Result<BitcoinVault> {
@@ -2537,6 +2595,225 @@ impl Keystore {
             .map_err(|_| KeystoreError::Vault("not a Bitcoin wallet's vault".into()))?;
         if vault.v != 1 {
             return Err(KeystoreError::Vault(format!("unknown Bitcoin vault version {}", vault.v)));
+        }
+        Ok(vault)
+    }
+}
+
+// ── Identity groups ──────────────────────────────────────────────────────────
+//
+// An identity group keeps one SLIP-0010 node (`identity::node_path()`) in its own vault, at the
+// group key's usual path, and in its record the node's public key and the identity keys made
+// below it. Each identity key is named by a purpose and a context, so the same phrase gives the
+// same key on every device; adding one opens the node, never the phrase. See `identity`.
+
+/// Everything an identity group's import needs.
+pub struct IdentityImport<'a> {
+    pub phrase: &'a str,
+    pub bip39_passphrase: &'a str,
+    /// The vault's password: it guards the node.
+    pub password: &'a str,
+    pub label: &'a str,
+    pub keep: KeepPhrase<'a>,
+}
+
+/// What an identity group's vault holds, as JSON inside the scrypt envelope.
+#[derive(Serialize, Deserialize)]
+struct IdentityVault {
+    v: u32,
+    family: String,
+    /// The node: its key and its chain code, hex.
+    node: String,
+}
+
+impl Drop for IdentityVault {
+    fn drop(&mut self) {
+        use zeroize::Zeroize;
+        self.node.zeroize();
+    }
+}
+
+impl Keystore {
+    /// Make an identity group from a phrase. The vault lands after its record, and both roll back
+    /// together. One per phrase and passphrase: a second would hold the same node.
+    pub fn import_identity(&self, req: &IdentityImport) -> Result<String> {
+        if req.password.is_empty() {
+            return Err(KeystoreError::InvalidParams("an identity group's vault needs a password".into()));
+        }
+        check_displayable(req.label, "label")?;
+        let seed = Seed::from_mnemonic(req.phrase, req.bip39_passphrase)?;
+        let node = crate::identity::Node::group_node(seed.as_secret());
+        let node_key = hex::encode(node.public_key());
+        let fingerprint = btc::master_fingerprint(seed.as_secret())?.to_string();
+        let (seed_link, prior_seeds) = self.seed_link(&seed)?;
+        drop(seed);
+        if self.get_groups()?.values().any(|g| g.is_identity() && g.node_key.as_deref() == Some(node_key.as_str())) {
+            return Err(KeystoreError::Refused(
+                "this phrase already has an identity group here; add keys to it with derive_identity".into(),
+            ));
+        }
+        let vault = IdentityVault { v: 1, family: crate::identity::FAMILY.into(), node: node.encode().to_string() };
+        let text = Zeroizing::new(serde_json::to_string(&vault).map_err(|e| KeystoreError::Vault(e.to_string()))?);
+        drop(vault);
+        drop(node);
+
+        let (phrase, made) = self.phrase_to_record(req.phrase, req.keep)?;
+        let forget_new_phrase = || self.forget_new_phrase(made, &phrase);
+        let id = new_group_id();
+        let record = Group {
+            seed: Some(seed_link.clone()),
+            storage: Storage::Extkey,
+            path_prefix: crate::identity::node_path(),
+            next_index: 0,
+            retired: Vec::new(),
+            used_passphrase: !req.bip39_passphrase.is_empty(),
+            label: String::new(),
+            created_ms: now_ms(),
+            family: Some(crate::identity::FAMILY.into()),
+            chain: None,
+            fingerprint: Some(fingerprint.clone()),
+            xpub: None,
+            phrase: phrase.clone(),
+            origin: None,
+            birthday: None,
+            node_key: Some(node_key),
+            identities: Vec::new(),
+        };
+        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            for old in prior_seeds.keys() {
+                if let Some(group) = groups.get_mut(old) {
+                    group.seed = Some(seed_link.clone());
+                    group.fingerprint.get_or_insert_with(|| fingerprint.clone());
+                }
+            }
+            groups.insert(id.clone(), record)
+        })
+        .inspect_err(|_| forget_new_phrase())?;
+        let landed = (|| {
+            self.write_group_label(&id, req.label)?;
+            self.write_group_vault(&id, &text, req.password)
+        })();
+        landed.inspect_err(|_| {
+            let _ = remove_path(&self.group_vault_path(&id));
+            let _ = remove_path(&self.stage_dir(&id));
+            let _ = self.write_group_label(&id, "");
+            let _ = self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+                for (old, seed) in &prior_seeds {
+                    if let Some(group) = groups.get_mut(old) {
+                        group.seed = seed.clone();
+                    }
+                }
+                groups.remove(&id)
+            });
+            forget_new_phrase();
+        })?;
+        Ok(id)
+    }
+
+    /// The identity groups' ids, and the only one when `id` is absent.
+    pub fn identity_group(&self, id: Option<&str>) -> Result<(String, Group)> {
+        let groups = self.get_groups()?;
+        let mut found: Vec<(String, Group)> = groups.into_iter().filter(|(_, g)| g.is_identity()).collect();
+        match id {
+            Some(id) => {
+                check_group_id(id)?;
+                found
+                    .into_iter()
+                    .find(|(gid, _)| gid == id)
+                    .ok_or_else(|| KeystoreError::NotFound(format!("identity group {id}")))
+            }
+            None => match found.len() {
+                1 => Ok(found.remove(0)),
+                0 => Err(KeystoreError::NotFound("no identity group: import one with import_identity".into())),
+                _ => Err(KeystoreError::InvalidParams(format!(
+                    "several identity groups; name one of: {}",
+                    found.iter().map(|(g, _)| g.as_str()).collect::<Vec<_>>().join(", ")
+                ))),
+            },
+        }
+    }
+
+    /// Make (or find again) the identity key for a purpose and a context, from the group's node.
+    /// Idempotent: the same purpose and context answer the same key, recorded once.
+    pub fn derive_identity(&self, group: Option<&str>, purpose: &str, context: &str, password: &str) -> Result<IdentityKey> {
+        crate::identity::context_path(purpose, context)?;
+        let (id, g) = self.identity_group(group)?;
+        let node = self.open_identity_node(&id, &g, password)?;
+        let key = IdentityKey {
+            key_ref: crate::identity::key_ref(&node.public_key(), purpose, context),
+            purpose: purpose.into(),
+            context: context.into(),
+            public_key: hex::encode(crate::identity::public_key(&*node.identity_key(purpose, context)?)),
+        };
+        drop(node);
+        if g.identities.contains(&key) {
+            return Ok(key);
+        }
+        let k = key.clone();
+        self.update(&self.groups_path(), |groups: &mut BTreeMap<String, Group>| {
+            if let Some(g) = groups.get_mut(&id) {
+                if !g.identities.contains(&k) {
+                    g.identities.push(k);
+                }
+            }
+        })?;
+        Ok(key)
+    }
+
+    /// Every identity key, with its group: from the records alone, no vault opened.
+    pub fn identity_keys(&self) -> Result<Vec<(String, Group, IdentityKey)>> {
+        let mut out = Vec::new();
+        for (gid, g) in self.get_groups()?.into_iter().filter(|(_, g)| g.is_identity()) {
+            for k in g.identities.clone() {
+                out.push((gid.clone(), g.clone(), k));
+            }
+        }
+        Ok(out)
+    }
+
+    /// One identity key by its account id.
+    pub fn identity_key(&self, key_ref: &str) -> Result<(String, Group, IdentityKey)> {
+        self.identity_keys()?
+            .into_iter()
+            .find(|(_, _, k)| k.key_ref == key_ref)
+            .ok_or_else(|| KeystoreError::NotFound(format!("identity {key_ref}")))
+    }
+
+    /// An identity key's Ed25519 seed, opened from its group's vault for this call only, and
+    /// refused unless it is the key the record names: a swapped vault signs nothing.
+    pub(crate) fn open_identity_key(&self, key_ref: &str, password: &str) -> Result<Zeroizing<[u8; 32]>> {
+        let (gid, g, k) = self.identity_key(key_ref)?;
+        let node = self.open_identity_node(&gid, &g, password)?;
+        let seed = node.identity_key(&k.purpose, &k.context)?;
+        if hex::encode(crate::identity::public_key(&seed)) != k.public_key {
+            return Err(KeystoreError::Refused(format!("the vault of group {gid} does not make identity {key_ref}")));
+        }
+        Ok(seed)
+    }
+
+    fn open_identity_node(&self, id: &str, g: &Group, password: &str) -> Result<crate::identity::Node> {
+        check_group_id(id)?;
+        if !self.scan()?.keys.iter().any(|k| k == id) {
+            return Err(KeystoreError::NotFound(format!("the key of group {id}")));
+        }
+        let vault = self.open_identity_vault_at(&self.group_vault_path(id), password)?;
+        let node = crate::identity::Node::decode(&vault.node)?;
+        if g.node_key.as_deref() != Some(hex::encode(node.public_key()).as_str()) {
+            return Err(KeystoreError::Refused(format!("the vault of group {id} holds another group's node")));
+        }
+        Ok(node)
+    }
+
+    fn open_identity_vault_at(&self, path: &Path, password: &str) -> Result<IdentityVault> {
+        let raw = std::fs::read_to_string(path).map_err(|e| KeystoreError::Io(e.to_string()))?;
+        check_kdf_params(&raw)?;
+        let bytes = Zeroizing::new(
+            eth_keystore::decrypt_key(path, password).map_err(|e| KeystoreError::Vault(e.to_string()))?,
+        );
+        let vault: IdentityVault = serde_json::from_slice(&bytes)
+            .map_err(|_| KeystoreError::Vault("not an identity group's vault".into()))?;
+        if vault.v != 1 || vault.family != crate::identity::FAMILY {
+            return Err(KeystoreError::Vault(format!("unknown identity vault version {}", vault.v)));
         }
         Ok(vault)
     }
@@ -6169,5 +6446,85 @@ mod tests {
             assert!(ks.sign_message(&ACCT0.to_string(), "pw", "hi").is_ok(), "{name}");
             assert!(ks.create_unrelated_account("pw", acked()).is_ok(), "{name}");
         }
+    }
+
+    // ── identity groups ─────────────────────────────────────────────────────────
+
+    const ABOUT: &str = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+    fn identity_import(ks: &Keystore, phrase: &str, keep: KeepPhrase) -> Result<String> {
+        ks.import_identity(&IdentityImport { phrase, bip39_passphrase: "", password: "pw", label: "", keep })
+    }
+
+    #[test]
+    fn an_identity_group_keeps_one_node_and_never_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let id = identity_import(&ks, ABOUT, KeepPhrase::No).unwrap();
+        let g = ks.get_groups().unwrap().remove(&id).unwrap();
+        assert!(g.is_identity() && !g.is_bitcoin());
+        assert_eq!(g.path_prefix, "m/7432'/0'");
+        assert_eq!(g.fingerprint.as_deref(), Some("73c5da0a"), "the phrase's wallet, as BIP-32 wallets name it");
+        assert!(g.xpub.is_none() && g.phrase.is_none() && g.node_key.is_some());
+        // The vault holds the node, its family and a version: nothing reaching above the node.
+        let bytes = eth_keystore::decrypt_key(ks.group_vault_path(&id), "pw").unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let mut keys: Vec<_> = v.as_object().unwrap().keys().cloned().collect();
+        keys.sort();
+        assert_eq!(keys, ["family", "node", "v"]);
+        let node = crate::identity::Node::decode(v["node"].as_str().unwrap()).unwrap();
+        let seed = Seed::from_mnemonic(ABOUT, "").unwrap();
+        assert_eq!(node.public_key(), crate::identity::Node::group_node(seed.as_secret()).public_key());
+        // One per phrase: a second would hold the same node.
+        assert!(matches!(identity_import(&ks, ABOUT, KeepPhrase::No), Err(KeystoreError::Refused(_))));
+        // It is no Bitcoin wallet, no EVM derivation group, and its only key cannot be forgotten.
+        assert!(ks.bitcoin_groups().unwrap().is_empty());
+        assert!(ks.bitcoin_account(&id).is_err());
+        assert!(matches!(ks.derivable_group(Some(&id)), Err(KeystoreError::Refused(_))));
+        assert!(matches!(ks.forget_derivation(&id), Err(KeystoreError::Refused(_))));
+    }
+
+    #[test]
+    fn identity_keys_are_the_same_after_a_restore_and_differ_by_context() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (ka, kb) = (Keystore::new(a.path()), Keystore::new(b.path()));
+        identity_import(&ka, ABOUT, KeepPhrase::No).unwrap();
+        identity_import(&kb, ABOUT, KeepPhrase::No).unwrap();
+        let x = ka.derive_identity(None, "room-identity", "room:a", "pw").unwrap();
+        let y = kb.derive_identity(None, "room-identity", "room:a", "pw").unwrap();
+        assert_eq!(x, y, "same key ref and key on another device from the same phrase");
+        // The reference derivation of m/7432'/0'/c0'…c7' for this phrase and context.
+        assert_eq!(x.public_key, "c8b57cf9c3cc450e042a6ce6f09b0664859d9a1dd916d75e16d76973b10afbba");
+        // Idempotent: asking again records nothing new.
+        assert_eq!(ka.derive_identity(None, "room-identity", "room:a", "pw").unwrap(), x);
+        let other = ka.derive_identity(None, "room-identity", "room:b", "pw").unwrap();
+        assert_ne!(other.public_key, x.public_key);
+        assert_eq!(ka.identity_keys().unwrap().len(), 2);
+        // A wrong password opens nothing and records nothing.
+        assert!(matches!(ka.derive_identity(None, "room-identity", "room:c", "nope"), Err(KeystoreError::Vault(_))));
+        assert_eq!(ka.identity_keys().unwrap().len(), 2);
+        assert!(ka.derive_identity(None, "Room", "room:c", "pw").is_err(), "a bad purpose");
+    }
+
+    #[test]
+    fn a_swapped_identity_vault_signs_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let a = identity_import(&ks, ABOUT, KeepPhrase::No).unwrap();
+        let b = identity_import(&ks, TEST_MNEMONIC, KeepPhrase::No).unwrap();
+        let k = ks.derive_identity(Some(&a), "room-identity", "room:a", "pw").unwrap();
+        assert!(ks.open_identity_key(&k.key_ref, "pw").is_ok());
+        std::fs::copy(ks.group_vault_path(&b), ks.group_vault_path(&a)).unwrap();
+        assert!(matches!(ks.open_identity_key(&k.key_ref, "pw"), Err(KeystoreError::Refused(_))));
+    }
+
+    #[test]
+    fn an_identity_group_from_a_kept_phrase_names_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ks = Keystore::new(dir.path());
+        let id = identity_import(&ks, ABOUT, KeepPhrase::New("phrase-pw")).unwrap();
+        let kept = ks.get_groups().unwrap()[&id].phrase.clone().expect("the record names the kept phrase");
+        let listed = ks.kept_phrases().unwrap();
+        assert!(listed.iter().any(|p| p.id == kept && p.groups.contains(&id)), "{listed:?}");
     }
 }

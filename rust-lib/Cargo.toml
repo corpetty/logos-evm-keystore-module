@@ -49,8 +49,14 @@ tempfile = "3"
 # plugin's export list keeps its symbols in (see CMakeLists.txt).
 bitcoin = { version = "0.32.102", default-features = false, features = ["std", "base64", "rand-std"] }
 
-# logos.signer/1: its payload types, signature checks and job bookkeeping.
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02" }
+# Identity keys: Ed25519 (RFC 8032) and SLIP-0010's HMAC-SHA512. hmac is already in the lock
+# graph; ed25519-dalek is new, pure Rust.
+ed25519-dalek = { version = "2", features = ["zeroize"] }
+hmac = "0.12"
+
+# logos.signer/1: its payload types, signature checks and job bookkeeping. The ed25519 family is
+# on corpetty/logos-signer-interface feat/ed25519-family (03eece5 + one commit), proposed upstream.
+logos-signer-interface = { git = "https://github.com/corpetty/logos-signer-interface", rev = "3ebac518b4a62bab534be01e669790bfc73a488e" }
 
 # The Logos runtime SDK is staged by the builder as a sibling crate. It is
 # optional + enabled by the default `logos_module` feature so `cargo test
@@ -66,7 +72,7 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Memory"] }
 
 [dev-dependencies]
-logos-signer-interface = { git = "https://github.com/logos-co/logos-signer-interface", rev = "d2f95e01b8c2aa1c1e1ed2c7cf18e7963a685d02", features = ["conformance", "mock"] }
+logos-signer-interface = { git = "https://github.com/corpetty/logos-signer-interface", rev = "3ebac518b4a62bab534be01e669790bfc73a488e", features = ["conformance", "mock"] }
 
 [features]
 default = ["logos_module"]

@@ -21,7 +21,7 @@ use crate::btc::{Chain as BtcChain, Family as BtcFamily};
 use crate::gate;
 use crate::keystore::{Derived, GroupLabelRequest, ImportRequest, KeepPhrase, Keystore, Storage};
 use crate::signer::{self as ks_signer, KeystoreSigner, Unlocks};
-use crate::{BitcoinImport, WalletStart};
+use crate::{BitcoinImport, IdentityImport, WalletStart};
 use logos_signer_interface::jobs::JobTable;
 use logos_signer_interface::{json as signer_json, wire};
 
@@ -224,6 +224,16 @@ pub trait KeystoreModule: Send + 'static {
     /// in place of `phrase` → `{ ok, group, family, chain, path, fingerprint, external, internal,
     /// phrase, origin, birthday }`. Tier D.
     fn import_bitcoin(&mut self, params_json: String) -> String;
+    /// An identity group from a phrase, keeping one SLIP-0010 node and never the root: `{ phrase,
+    /// passphrase?, password, label?, keepPhrase?: { password } }`, or `{ keptPhrase,
+    /// phrasePassword, … }` in place of `phrase` → `{ ok, group, fingerprint, phrase }`. One per
+    /// phrase and passphrase. Tier D.
+    fn import_identity(&mut self, params_json: String) -> String;
+    /// The Ed25519 identity key for a purpose and a context, made from the group's node: `{ group?,
+    /// purpose, context, password }` → `{ ok, account, publicKey, purpose, context }`, `account`
+    /// being its `logos.signer/1` id. The same purpose and context give the same key on every
+    /// device restored from the phrase. Tier D.
+    fn derive_identity(&mut self, params_json: String) -> String;
     /// A kept phrase's words, for the keys app to show: `{ phrase, password }` → `{ ok, phrase,
     /// words }`. Tier D.
     fn show_phrase(&mut self, params_json: String) -> String;
@@ -523,6 +533,32 @@ struct DeviceKeyParams {
 struct DeviceWalletParams {
     signer: String,
     account: String,
+}
+
+#[derive(Deserialize)]
+struct ImportIdentityParams {
+    #[serde(default)]
+    phrase: String,
+    #[serde(default)]
+    passphrase: String,
+    password: String,
+    #[serde(default)]
+    label: String,
+    #[serde(default, rename = "keepPhrase")]
+    keep_phrase: Option<PasswordParams>,
+    #[serde(default, rename = "keptPhrase")]
+    kept_phrase: Option<String>,
+    #[serde(default, rename = "phrasePassword")]
+    phrase_password: String,
+}
+
+#[derive(Deserialize)]
+struct DeriveIdentityParams {
+    #[serde(default)]
+    group: Option<String>,
+    purpose: String,
+    context: String,
+    password: String,
 }
 
 #[derive(Deserialize)]
@@ -1611,6 +1647,66 @@ impl KeystoreModule for KeystoreModuleImpl {
                         "phrase": kept,
                         "origin": if start == WalletStart::Created { "created" } else { "restored" },
                         "birthday": birthday })
+                .to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn import_identity(&mut self, params_json: String) -> String {
+        if !self.may_mutate("import_identity") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: ImportIdentityParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let (typed, passphrase, password) =
+            (Zeroizing::new(p.phrase), Zeroizing::new(p.passphrase), Zeroizing::new(p.password));
+        let (keep_password, phrase_password) =
+            (Zeroizing::new(p.keep_phrase.map(|k| k.password)), Zeroizing::new(p.phrase_password));
+        let ks = match self.ks() {
+            Ok(ks) => ks,
+            Err(e) => return err(e),
+        };
+        let (phrase, keep) =
+            match words_and_keep(ks, typed, p.kept_phrase.as_deref(), keep_password.as_deref(), &phrase_password) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+        let req = IdentityImport { phrase: &phrase, bip39_passphrase: &passphrase, password: &password, label: &p.label, keep };
+        match ks.import_identity(&req) {
+            Ok(id) => {
+                let record = ks.get_groups().ok().and_then(|mut gs| gs.remove(&id));
+                let fingerprint = record.as_ref().and_then(|r| r.fingerprint.clone());
+                let kept = record.and_then(|r| r.phrase);
+                self.announce();
+                json!({ "ok": true, "group": id, "fingerprint": fingerprint, "phrase": kept }).to_string()
+            }
+            Err(e) => err(e),
+        }
+    }
+
+    fn derive_identity(&mut self, params_json: String) -> String {
+        if !self.may_mutate("derive_identity") {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: DeriveIdentityParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let password = Zeroizing::new(p.password);
+        let ks = match self.ks() {
+            Ok(ks) => ks,
+            Err(e) => return err(e),
+        };
+        match ks.derive_identity(p.group.as_deref(), &p.purpose, &p.context, &password) {
+            Ok(k) => {
+                self.announce();
+                json!({ "ok": true, "account": k.key_ref, "publicKey": k.public_key,
+                        "purpose": k.purpose, "context": k.context })
                 .to_string()
             }
             Err(e) => err(e),

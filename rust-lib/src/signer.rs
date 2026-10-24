@@ -20,6 +20,7 @@ use logos_signer_interface::wire::{
 use logos_signer_interface::{Signer, INTERFACE};
 
 use crate::btc::{self, AccountPublic, AccountSecret};
+use crate::identity;
 use crate::keystore::{Keystore, KeystoreError};
 use crate::locked::LockedBytes;
 
@@ -48,10 +49,12 @@ pub fn from_keystore(e: KeystoreError) -> SignerError {
     SignerError::new(code, e.to_string())
 }
 
-/// What `sign` names: an EVM account by address, or a Bitcoin wallet by group id.
+/// What `sign` names: an EVM account by address, a Bitcoin wallet by group id, or an identity
+/// key by its key ref.
 enum Target {
     Evm(Address),
     Bitcoin { id: String, acct: AccountPublic },
+    Identity { key_ref: String, public_key: String },
 }
 
 impl Target {
@@ -59,6 +62,10 @@ impl Target {
         let unknown = || SignerError::new(ErrorCode::UnknownAccount, format!("no account {id}"));
         if let Ok(addr) = Address::from_str(id.trim()) {
             return if ks.has_address(&addr.to_string()) { Ok(Target::Evm(addr)) } else { Err(unknown()) };
+        }
+        if identity::is_key_ref(id.trim()) {
+            let (_, _, k) = ks.identity_key(id.trim()).map_err(|_| unknown())?;
+            return Ok(Target::Identity { key_ref: k.key_ref, public_key: k.public_key });
         }
         let (acct, _) = ks.bitcoin_account(id.trim()).map_err(|_| unknown())?;
         Ok(Target::Bitcoin { id: id.trim().to_string(), acct })
@@ -68,6 +75,7 @@ impl Target {
         match self {
             Target::Evm(a) => a.to_string().to_ascii_lowercase(),
             Target::Bitcoin { id, .. } => id.to_ascii_lowercase(),
+            Target::Identity { key_ref, .. } => key_ref.clone(),
         }
     }
 }
@@ -76,6 +84,8 @@ impl Target {
 enum Material {
     Evm(PrivateKeySigner),
     Bitcoin(AccountSecret),
+    /// The identity key's Ed25519 seed.
+    Identity(Zeroizing<[u8; 32]>),
 }
 
 fn open(ks: &Keystore, target: &Target, password: &str) -> Result<Material> {
@@ -84,6 +94,9 @@ fn open(ks: &Keystore, target: &Target, password: &str) -> Result<Material> {
         Target::Bitcoin { id, acct } => {
             let (secret, _) = ks.open_bitcoin_vault(id, password, acct).map_err(from_keystore)?;
             Ok(Material::Bitcoin(secret))
+        }
+        Target::Identity { key_ref, .. } => {
+            ks.open_identity_key(key_ref, password).map(Material::Identity).map_err(from_keystore)
         }
     }
 }
@@ -94,6 +107,8 @@ enum Held {
     Evm(LockedBytes),
     /// The account key as its base58 text, and the database key as hex.
     Bitcoin { account_key: LockedBytes, database_key: LockedBytes },
+    /// The identity key's Ed25519 seed.
+    Identity(LockedBytes),
 }
 
 struct Unlock {
@@ -211,6 +226,15 @@ fn check_items(target: &Target, items: &[HashItem]) -> Result<Vec<([u8; 32], Opt
                         .ok_or_else(|| invalid(format!("{path} is not a receive or change key of this wallet")))?;
                     Ok((digest, Some(at)))
                 }
+                Target::Identity { .. } => {
+                    if item.scheme != Scheme::Ed25519 {
+                        return Err(SignerError::new(ErrorCode::Unsupported, format!("{:?} for an identity key", item.scheme)));
+                    }
+                    if item.path.is_some() {
+                        return Err(invalid("an identity key signs with its own key, at no path"));
+                    }
+                    Ok((digest, None))
+                }
             }
         })
         .collect()
@@ -237,6 +261,12 @@ fn sign_items(
                 let (change, index) = at.expect("checked: a Bitcoin item has its path");
                 sign_bitcoin(secret, acct, i, digest, change, index, items[i].scheme)?
             }
+            (Material::Identity(seed), Target::Identity { public_key, .. }) => Signature {
+                item: i,
+                signature: hex::encode(identity::sign(seed, digest)),
+                recovery_id: None,
+                pubkey: public_key.clone(),
+            },
             _ => return Err(internal("the key opened is not this account's kind")),
         });
     }
@@ -311,6 +341,10 @@ impl KeystoreSigner<'_> {
                     database_key: LockedBytes::new(database_key.as_bytes()),
                 }
             }
+            Target::Identity { key_ref, .. } => {
+                let seed = self.ks.open_identity_key(key_ref, password).map_err(from_keystore)?;
+                Held::Identity(LockedBytes::new(&seed[..]))
+            }
         };
         let key = target.key();
         self.unlocks.lock(Some(&key));
@@ -345,6 +379,11 @@ impl KeystoreSigner<'_> {
             (Held::Bitcoin { account_key, .. }, Target::Bitcoin { acct, .. }) => {
                 Material::Bitcoin(AccountSecret::decode(utf8(account_key)?, acct.chain).map_err(from_keystore)?)
             }
+            (Held::Identity(bytes), Target::Identity { .. }) => {
+                let mut seed = Zeroizing::new([0u8; 32]);
+                seed.copy_from_slice(bytes.as_slice());
+                Material::Identity(seed)
+            }
             _ => return Err(internal("the unlock is not this account's kind")),
         };
         if let Some(n) = u.left.as_mut() {
@@ -360,7 +399,7 @@ pub fn info() -> SignerInfo {
         interface: INTERFACE.into(),
         kind: "keystore".into(),
         model: "scrypt key files".into(),
-        families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot],
+        families: vec![Family::Evm, Family::Bitcoin, Family::BitcoinTaproot, Family::Ed25519],
         request_kinds: vec![RequestKind::Hash],
         shows_request: false,
         collects: Collects::Password,
@@ -422,6 +461,24 @@ pub fn accounts(ks: &Keystore) -> Result<Vec<Account>> {
             address: None,
             xpub: Some(acct.xpub.to_string()),
             label: names.get(&id).cloned().filter(|l| !l.is_empty()),
+            available: true,
+        });
+    }
+    // An identity key: its public key as the address, its wallet's fingerprint, no path. The
+    // purpose names it; the context, which may name a room, stays in the keystore's records.
+    for (gid, g, k) in ks.identity_keys().map_err(from_keystore)? {
+        out.push(Account {
+            id: k.key_ref.clone(),
+            family: Family::Ed25519,
+            chain: None,
+            path: None,
+            fingerprint: g.fingerprint.clone(),
+            address: Some(k.public_key.clone()),
+            xpub: None,
+            label: Some(match names.get(&gid).filter(|l| !l.is_empty()) {
+                Some(wallet) => format!("{wallet} · {}", k.purpose),
+                None => k.purpose.clone(),
+            }),
             available: true,
         });
     }
@@ -497,6 +554,16 @@ mod tests {
             })
             .unwrap();
         }
+        // An identity group and one identity key, so every check below covers ed25519 too.
+        ks.import_identity(&crate::IdentityImport {
+            phrase: PHRASE,
+            bip39_passphrase: "",
+            password: "pw",
+            label: "",
+            keep: crate::keystore::KeepPhrase::No,
+        })
+        .unwrap();
+        ks.derive_identity(None, "room-identity", "room:a", "pw").unwrap();
         (dir, ks)
     }
 

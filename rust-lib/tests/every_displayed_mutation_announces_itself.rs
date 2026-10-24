@@ -31,6 +31,8 @@ const ANNOUNCES: &[&str] = &[
     "remove_unexplained",
     "settle",
     "import_bitcoin",
+    "import_identity",
+    "derive_identity",
     "forget_phrase",
     "device_database_key",
     "forget_device_wallet",
