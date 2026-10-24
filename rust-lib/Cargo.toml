@@ -53,6 +53,8 @@ bitcoin = { version = "0.32.102", default-features = false, features = ["std", "
 # graph; ed25519-dalek is new, pure Rust.
 ed25519-dalek = { version = "2", features = ["zeroize"] }
 hmac = "0.12"
+# Identity keys open libsodium sealed boxes (crypto_box_seal) addressed to their X25519 key.
+crypto_box = { version = "0.9", features = ["seal", "std"] }
 
 # logos.signer/1: its payload types, signature checks and job bookkeeping. The ed25519 family is
 # on corpetty/logos-signer-interface feat/ed25519-family (03eece5 + one commit), proposed upstream.

@@ -1232,6 +1232,21 @@ scheme `ed25519` and no path is signed as Ed25519 over its 32 bytes, with the pa
 unlock, as every other account is. The family is on the signer interface's
 `feat/ed25519-family` branch (corpetty/logos-signer-interface `3ebac51`), proposed upstream.
 
+**What an identity opens.** A room member is one identity in two forms: it authors with its Ed25519
+key and is written to at the X25519 key libsodium derives from it
+(`crypto_sign_ed25519_pk_to_curve25519`). Two operations, the keystore's own, answer the manager
+alone (Tier M), with the account's password or inside its unlock, one request counting once:
+
+| Method | | |
+|---|---|---|
+| `identity_open` | `{ account, sealed: [hex], secret? }` → `{ ok, account, opened: [hex] }` | opens each libsodium sealed box (`crypto_box_seal`) addressed to the identity; one refusal, `invalid`, for a box that is not for it or was altered |
+| `identity_secret` | `{ account, records: [hex], secret? }` → `{ ok, account, secrets: [hex] }` | HMAC-SHA256 keyed by the identity's seed over each record: one secret for one purpose, the same after a restore |
+
+Neither returns a key, and neither is a signature, which is why `logos.signer/1` does not carry
+them; the manager offers them to requesters only as legs a person approves or an unlock covers.
+They are a proposal (the signer interface's question of where decryption belongs) and held to
+vectors from libsodium itself (`tools/gen_libsodium_vectors.py`).
+
 ## The keystore as a signer (`logos.signer/1`)
 
 The keystore implements [`logos.signer/1`](https://github.com/logos-co/logos-signer-interface),
@@ -1248,7 +1263,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key`, `identity_open`, `identity_secret` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `import_identity`, `derive_identity`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |

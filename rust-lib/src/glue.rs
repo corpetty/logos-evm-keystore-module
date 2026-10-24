@@ -202,6 +202,13 @@ pub trait KeystoreModule: Send + 'static {
     /// `{ account, password, ttlMs?, count? }` → `{ ok, account, expiresInMs, countLeft }`. Tier M:
     /// the manager keeps which apps the unlock covers, so nothing else may reach it.
     fn unlock(&mut self, params_json: String) -> String;
+    /// Open sealed boxes addressed to an identity key's X25519 form: `{ account, sealed: [hex],
+    /// secret? }` → `{ ok, account, opened: [hex] }`, with the password or inside the account's unlock.
+    /// The keystore's own, outside `logos.signer/1`, whose answers are signatures only. Tier M.
+    fn identity_open(&mut self, params_json: String) -> String;
+    /// A secret for each record, HMAC-SHA256 keyed by the identity's seed: `{ account, records:
+    /// [hex], secret? }` → `{ ok, account, secrets: [hex] }`. Tier M.
+    fn identity_secret(&mut self, params_json: String) -> String;
     /// `{ account? }` locks one account, `{}` every one → `{ ok, locked }`. Tier M.
     fn lock(&mut self, params_json: String) -> String;
     /// `{ ok, unlocked: [{ account, expiresInMs, countLeft }] }`. The manager and the custodian.
@@ -349,6 +356,40 @@ fn not_authorized() -> String {
 }
 
 impl KeystoreModuleImpl {
+    /// `identity_open` and `identity_secret`: the manager alone, with the password or inside the
+    /// account's unlock. Every input and output is hex; the outputs are wiped once encoded.
+    fn identity_op(&mut self, method: &str, params_json: String, op: ks_signer::IdentityOp) -> String {
+        if !self.is_manager(method) {
+            let _ = Zeroizing::new(params_json);
+            return not_authorized();
+        }
+        let p: IdentityOpParams = match parse_secret_params(params_json) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let secret = p.secret.map(Zeroizing::new);
+        let raw = match op {
+            ks_signer::IdentityOp::Open => &p.sealed,
+            ks_signer::IdentityOp::Secret => &p.records,
+        };
+        let inputs: std::result::Result<Vec<Vec<u8>>, _> =
+            raw.iter().map(|h| hex::decode(h.trim().trim_start_matches("0x"))).collect();
+        let Ok(inputs) = inputs else { return err("inputs are hex") };
+        let mut s = match self.signer() {
+            Ok(s) => s,
+            Err(e) => return err(e),
+        };
+        match s.identity_op(&p.account, secret.as_deref().map(|x| x.as_str()), op, &inputs) {
+            Ok(out) => {
+                let out: Vec<Zeroizing<String>> = out.iter().map(|b| Zeroizing::new(hex::encode(&b[..]))).collect();
+                let field = if op == ks_signer::IdentityOp::Open { "opened" } else { "secrets" };
+                let list: Vec<&str> = out.iter().map(|z| z.as_str()).collect();
+                json!({ "ok": true, "account": p.account, field: list }).to_string()
+            }
+            Err(e) => wire::err(&e),
+        }
+    }
+
     /// Tier A: the configured approver, and nothing else.
     ///
     /// `HostAnchor` is refused deliberately. It is one undifferentiated bag
@@ -494,6 +535,18 @@ struct GroupLabelParams {
     address: String,
     #[serde(default)]
     password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IdentityOpParams {
+    account: String,
+    #[serde(default)]
+    sealed: Vec<String>,
+    #[serde(default)]
+    records: Vec<String>,
+    #[serde(default)]
+    secret: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1435,6 +1488,14 @@ impl KeystoreModule for KeystoreModuleImpl {
             Ok(mut s) => signer_json::cancel_sign(&mut s, &job),
             Err(e) => err(e),
         }
+    }
+
+    fn identity_open(&mut self, params_json: String) -> String {
+        self.identity_op("identity_open", params_json, ks_signer::IdentityOp::Open)
+    }
+
+    fn identity_secret(&mut self, params_json: String) -> String {
+        self.identity_op("identity_secret", params_json, ks_signer::IdentityOp::Secret)
     }
 
     fn unlock(&mut self, params_json: String) -> String {

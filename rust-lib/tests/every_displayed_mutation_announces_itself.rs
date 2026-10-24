@@ -60,6 +60,9 @@ const SILENT: &[&str] = &[
     "account_descriptors",
     // The signer interface: signing and unlocking move no account a reader shows.
     "signer_info",
+    // What an identity opens persists nothing.
+    "identity_open",
+    "identity_secret",
     "signer_accounts",
     "sign",
     "sign_status",

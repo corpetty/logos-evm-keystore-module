@@ -368,6 +368,32 @@ impl KeystoreSigner<'_> {
         }
     }
 
+    /// What an identity key opens, for the manager alone: each sealed box addressed to it, or a
+    /// secret for each record, with the account's password or inside its unlock, counting one
+    /// request. Nothing here is a signature, so `logos.signer/1` does not carry it.
+    pub fn identity_op(&mut self, account: &str, secret: Option<&str>, op: IdentityOp, inputs: &[Vec<u8>]) -> Result<Vec<Zeroizing<Vec<u8>>>> {
+        let target = Target::resolve(self.ks, account)?;
+        if !matches!(target, Target::Identity { .. }) {
+            return Err(SignerError::new(ErrorCode::Unsupported, "only an identity key opens sealed boxes or derives secrets"));
+        }
+        if inputs.is_empty() {
+            return Err(invalid("nothing to open"));
+        }
+        let material = match secret {
+            Some(s) => open(self.ks, &target, s)?,
+            None => self.from_unlock(&target)?,
+        };
+        let Material::Identity(seed) = &material else { return Err(internal("the key opened is not an identity")) };
+        inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| match op {
+                IdentityOp::Open => identity::open_sealed(seed, input).map_err(|e| invalid(format!("item {i}: {e}"))),
+                IdentityOp::Secret => Ok(Zeroizing::new(identity::derived_secret(seed, input).to_vec())),
+            })
+            .collect()
+    }
+
     /// The key an unlock holds, counting one request against it.
     fn from_unlock(&mut self, target: &Target) -> Result<Material> {
         let locked = || SignerError::new(ErrorCode::Locked, "this account is locked: sign with its password, or unlock it");
@@ -392,6 +418,15 @@ impl KeystoreSigner<'_> {
         self.unlocks.sweep();
         Ok(material)
     }
+}
+
+/// What an identity key is asked to open.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IdentityOp {
+    /// Sealed boxes addressed to its X25519 key: their contents.
+    Open,
+    /// Records: HMAC-SHA256 keyed by the identity's seed over each.
+    Secret,
 }
 
 pub fn info() -> SignerInfo {
@@ -568,6 +603,37 @@ mod tests {
     }
 
     fn no_device(_: &mut KeystoreSigner<'_>, _: &str) {}
+
+    #[test]
+    fn an_identity_opens_what_was_sealed_to_it_and_derives_its_secrets() {
+        let (_dir, ks) = keystore();
+        let (mut unlocks, mut jobs) = (Unlocks::default(), JobTable::new());
+        let mut s = KeystoreSigner { ks: &ks, unlocks: &mut unlocks, jobs: &mut jobs };
+        let acct = s.accounts().unwrap().into_iter().find(|a| a.family == Family::Ed25519).unwrap();
+        let ed: [u8; 32] = hex::decode(acct.address.as_deref().unwrap()).unwrap().try_into().unwrap();
+        let to_me = crypto_box::PublicKey::from(identity::x25519_public(&ed).unwrap());
+        let boxed = to_me.seal(&mut rand::rngs::OsRng, b"epoch grant").unwrap();
+        let opened = s.identity_op(&acct.id, Some("pw"), IdentityOp::Open, &[boxed.clone()]).unwrap();
+        assert_eq!(&opened[0][..], b"epoch grant");
+        let info = identity::record("muster.room.founding-key.v1", &[("room", identity::Field::Text("room:a"))]);
+        let a = s.identity_op(&acct.id, Some("pw"), IdentityOp::Secret, &[info.clone()]).unwrap();
+        assert_eq!(a[0].len(), 32);
+        // Refusals: a wrong password, no password and no unlock, a box for someone else, an EVM account.
+        assert_eq!(s.identity_op(&acct.id, Some("nope"), IdentityOp::Open, &[boxed.clone()]).unwrap_err().code, ErrorCode::WrongSecret);
+        assert_eq!(s.identity_op(&acct.id, None, IdentityOp::Open, &[boxed.clone()]).unwrap_err().code, ErrorCode::Locked);
+        let other = crypto_box::PublicKey::from(identity::x25519_public(&[9u8; 32]).unwrap_or([9u8; 32])).seal(&mut rand::rngs::OsRng, b"x").unwrap();
+        assert_eq!(s.identity_op(&acct.id, Some("pw"), IdentityOp::Open, &[other]).unwrap_err().code, ErrorCode::Invalid);
+        let evm = s.accounts().unwrap().into_iter().find(|a| a.family == Family::Evm).unwrap();
+        assert_eq!(s.identity_op(&evm.id, Some("pw"), IdentityOp::Open, &[boxed.clone()]).unwrap_err().code, ErrorCode::Unsupported);
+        // Inside an unlock, with its count: each request counts once, however many boxes it opens.
+        s.unlock(&acct.id, "pw", None, Some(1)).unwrap();
+        let both = s.identity_op(&acct.id, None, IdentityOp::Open, &[boxed.clone(), boxed.clone()]).unwrap();
+        assert_eq!(both.len(), 2);
+        assert_eq!(s.identity_op(&acct.id, None, IdentityOp::Secret, &[info.clone()]).unwrap_err().code, ErrorCode::Locked);
+        // The same secret again after a restore of the same phrase is checked in keystore.rs.
+        let again = s.identity_op(&acct.id, Some("pw"), IdentityOp::Secret, &[info]).unwrap();
+        assert_eq!(a[0][..], again[0][..]);
+    }
 
     #[test]
     fn the_keystore_passes_the_signer_conformance_suite() {

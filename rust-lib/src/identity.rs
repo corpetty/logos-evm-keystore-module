@@ -249,6 +249,52 @@ pub fn sign(seed: &[u8; 32], message: &[u8]) -> [u8; 64] {
     ed25519_dalek::SigningKey::from_bytes(seed).sign(message).to_bytes()
 }
 
+// ── what an identity opens ───────────────────────────────────────────────────
+//
+// An identity's X25519 key is the one libsodium derives from its Ed25519 key, so a room member is
+// one identity in two forms: it authors with Ed25519 and is written to with X25519. These two
+// operations return what was sealed to the identity, or a secret for one purpose; neither returns
+// a key. They are the keystore's own, outside `logos.signer/1`, whose answers are signatures only.
+
+/// libsodium's `crypto_box_SEALBYTES`: an ephemeral public key and a MAC.
+pub const SEAL_BYTES: usize = 48;
+
+/// libsodium's `crypto_sign_ed25519_sk_to_curve25519`: SHA-512 of the seed, clamped.
+fn x25519_secret(seed: &[u8; 32]) -> Zeroizing<[u8; 32]> {
+    let h = Zeroizing::new(<[u8; 64]>::from(Sha512::digest(seed)));
+    let mut s = Zeroizing::new([0u8; 32]);
+    s.copy_from_slice(&h[..32]);
+    s[0] &= 248;
+    s[31] &= 127;
+    s[31] |= 64;
+    s
+}
+
+/// An Ed25519 public key's X25519 form, as libsodium's `crypto_sign_ed25519_pk_to_curve25519`.
+pub fn x25519_public(ed25519: &[u8; 32]) -> Result<[u8; 32]> {
+    let vk = ed25519_dalek::VerifyingKey::from_bytes(ed25519).map_err(|_| bad("not an Ed25519 public key"))?;
+    Ok(vk.to_montgomery().to_bytes())
+}
+
+/// Open a `crypto_box_seal` box addressed to the identity. One answer for every failure: not for
+/// this identity, or altered.
+pub fn open_sealed(seed: &[u8; 32], sealed: &[u8]) -> Result<Zeroizing<Vec<u8>>> {
+    let refused = || KeystoreError::Refused("the sealed box does not open for this identity".into());
+    if sealed.len() < SEAL_BYTES {
+        return Err(refused());
+    }
+    let sk = crypto_box::SecretKey::from(*x25519_secret(seed));
+    sk.unseal(sealed).map(Zeroizing::new).map_err(|_| refused())
+}
+
+/// HMAC-SHA256 keyed by the identity's seed over a record: one secret for one purpose, the same
+/// on every device restored from the phrase. Muster derives a room's first epoch key this way.
+pub fn derived_secret(seed: &[u8; 32], record: &[u8]) -> Zeroizing<[u8; 32]> {
+    let mut m = Hmac::<Sha256>::new_from_slice(seed).expect("HMAC takes any key length");
+    m.update(record);
+    Zeroizing::new(m.finalize().into_bytes().into())
+}
+
 /// An identity account's id in `logos.signer/1`: stable across a restore from the same phrase
 /// (the node is the phrase's), and naming no path.
 pub fn key_ref(node_public: &[u8; 32], purpose: &str, context: &str) -> String {
@@ -330,6 +376,51 @@ mod tests {
         let r = record("d", &[("aa", Field::Text("y")), ("b", Field::Text("x"))]);
         // 82 | 61 64 | a2 | 61 62, 61 78 | 62 61 61, 61 79
         assert_eq!(hex::encode(r), "826164a2616261786261616179");
+    }
+
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Libsodium {
+        seed: String,
+        ed_pk: String,
+        msg: String,
+        sig: String,
+        x_pk: String,
+        x_sk: String,
+        plain: String,
+        sealed: String,
+        info: String,
+        derived_secret: String,
+    }
+
+    /// Vectors made by libsodium itself (`tools/gen_libsodium_vectors.py`), the library Muster's
+    /// rooms run on.
+    #[test]
+    fn identity_operations_agree_with_libsodium() {
+        let vs: Vec<Libsodium> = serde_json::from_str(include_str!("../tests/vectors/libsodium.json")).unwrap();
+        assert!(!vs.is_empty());
+        let b32 = |s: &str| -> [u8; 32] { hex::decode(s).unwrap().try_into().unwrap() };
+        for v in vs {
+            let seed = b32(&v.seed);
+            assert_eq!(hex::encode(public_key(&seed)), v.ed_pk);
+            assert_eq!(hex::encode(sign(&seed, &hex::decode(&v.msg).unwrap())), v.sig);
+            assert_eq!(hex::encode(x25519_public(&b32(&v.ed_pk)).unwrap()), v.x_pk);
+            assert_eq!(hex::encode(&x25519_secret(&seed)[..]), v.x_sk);
+            assert_eq!(&open_sealed(&seed, &hex::decode(&v.sealed).unwrap()).unwrap()[..], &hex::decode(&v.plain).unwrap()[..]);
+            assert_eq!(hex::encode(&derived_secret(&seed, &hex::decode(&v.info).unwrap())[..]), v.derived_secret);
+        }
+    }
+
+    #[test]
+    fn a_box_for_another_identity_or_altered_does_not_open() {
+        let (a, b) = ([1u8; 32], [2u8; 32]);
+        let to_a = crypto_box::PublicKey::from(x25519_public(&public_key(&a)).unwrap());
+        let mut boxed = to_a.seal(&mut rand::rngs::OsRng, b"grant").unwrap();
+        assert_eq!(&open_sealed(&a, &boxed).unwrap()[..], b"grant");
+        assert!(open_sealed(&b, &boxed).is_err());
+        boxed[50] ^= 1;
+        assert!(open_sealed(&a, &boxed).is_err());
+        assert!(open_sealed(&a, &[0u8; 10]).is_err());
     }
 
     #[test]
