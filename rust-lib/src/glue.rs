@@ -239,7 +239,8 @@ pub trait KeystoreModule: Send + 'static {
     /// The Ed25519 identity key for a purpose and a context, made from the group's node: `{ group?,
     /// purpose, context, password }` → `{ ok, account, publicKey, purpose, context }`, `account`
     /// being its `logos.signer/1` id. The same purpose and context give the same key on every
-    /// device restored from the phrase. Tier D.
+    /// device restored from the phrase. Tier D, and Tier M: the manager calls it on an identity
+    /// request the person approved. Refusals carry the signer interface's `code`.
     fn derive_identity(&mut self, params_json: String) -> String;
     /// A kept phrase's words, for the keys app to show: `{ phrase, password }` → `{ ok, phrase,
     /// words }`. Tier D.
@@ -1750,7 +1751,8 @@ impl KeystoreModule for KeystoreModuleImpl {
     }
 
     fn derive_identity(&mut self, params_json: String) -> String {
-        if !self.may_mutate("derive_identity") {
+        // The custodian, or the manager on an identity request the person approved in the keys app.
+        if !self.may_mutate("derive_identity") && !self.is_manager("derive_identity") {
             let _ = Zeroizing::new(params_json);
             return not_authorized();
         }
@@ -1770,7 +1772,8 @@ impl KeystoreModule for KeystoreModuleImpl {
                         "purpose": k.purpose, "context": k.context })
                 .to_string()
             }
-            Err(e) => err(e),
+            // Coded as the signer interface codes it: a wrong password is `wrong_secret`.
+            Err(e) => wire::err(&ks_signer::from_keystore(e)),
         }
     }
 

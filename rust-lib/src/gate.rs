@@ -221,7 +221,9 @@ pub fn tier_d_admits(method: &str, custodians: &[String], caller: &Caller) -> bo
 pub const TIER_M_METHODS: &[&str] =
     &["sign", "sign_status", "sign_result", "cancel_sign", "unlock", "lock", "database_key", "device_database_key",
       // What an identity key opens: a sealed box addressed to it, or a secret for a record.
-      "identity_open", "identity_secret"];
+      "identity_open", "identity_secret",
+      // An identity key, made on a request the person approved in the keys app.
+      "derive_identity"];
 
 /// Tier M: a configured manager, for a method the registry names.
 pub fn tier_m_admits(method: &str, managers: &[String], caller: &Caller) -> bool {

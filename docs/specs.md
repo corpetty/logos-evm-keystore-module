@@ -1219,7 +1219,7 @@ one opens the node, never the phrase. `7432'` is provisional and registered nowh
 | Method | Tier | |
 |---|---|---|
 | `import_identity` | D | `{ phrase, passphrase?, password, label?, keepPhrase?: { password } }`, or `{ keptPhrase, phrasePassword, … }` in place of `phrase` → `{ ok, group, fingerprint, phrase }` |
-| `derive_identity` | D | `{ group?, purpose, context, password }` → `{ ok, account, publicKey, purpose, context }`. Idempotent: asking again answers the same key and records nothing |
+| `derive_identity` | D and M | `{ group?, purpose, context, password }` → `{ ok, account, publicKey, purpose, context }`. Idempotent: asking again answers the same key and records nothing. The manager calls it on an identity request the person approved in the keys app (its `request_identity`, which derives for `<module>/<context>`); refusals carry the signer interface's `code` |
 
 Both announce. `group` may be omitted while there is one identity group.
 
@@ -1263,7 +1263,7 @@ manager. `rust-lib/src/signer.rs` holds the code; it passes the interface's conf
 |---|---|
 | `signer_info` | anyone: it describes the kind of signer, not an account |
 | `signer_accounts`, `unlocked` | a configured **manager** or **custodian**: a Bitcoin xpub reveals the wallet's whole history |
-| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key`, `identity_open`, `identity_secret` | a configured **manager** (Tier M, default `signer_manager_module`) |
+| `sign`, `sign_status`, `sign_result`, `cancel_sign`, `unlock`, `lock`, `database_key`, `device_database_key`, `identity_open`, `identity_secret`, `derive_identity` | a configured **manager** (Tier M, default `signer_manager_module`) |
 | `import_bitcoin`, `import_identity`, `derive_identity`, `show_phrase`, `forget_phrase`, `forget_device_wallet` | a configured **custodian** (Tier D) |
 | `device_wallets` | a configured **manager** or **custodian** |
 | `list_phrases` | anyone: ids and the wallets that name them, never words |
